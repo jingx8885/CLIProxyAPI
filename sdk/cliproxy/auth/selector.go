@@ -232,12 +232,14 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						return false, blockReasonNone, time.Time{}
 					}
 					if state.NextRetryAfter.After(now) {
-						next := state.NextRetryAfter
-						if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
-							next = state.Quota.NextRecoverAt
+						// Prefer ResetAt over NextRecoverAt for more accurate reset time
+						next := getEffectiveResetTimeFromState(&state.Quota, state.NextRetryAfter)
+						if !next.IsZero() && !next.After(now) {
+							// Reset time has passed, quota should be available
+							return false, blockReasonNone, time.Time{}
 						}
-						if next.Before(now) {
-							next = now
+						if next.IsZero() || next.Before(now) {
+							next = state.NextRetryAfter
 						}
 						if state.Quota.Exceeded {
 							return true, blockReasonCooldown, next
@@ -251,12 +253,14 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return false, blockReasonNone, time.Time{}
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
-		next := auth.NextRetryAfter
-		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
-			next = auth.Quota.NextRecoverAt
+		// Prefer ResetAt over NextRecoverAt for more accurate reset time
+		next := getEffectiveResetTimeFromState(&auth.Quota, auth.NextRetryAfter)
+		if !next.IsZero() && !next.After(now) {
+			// Reset time has passed, quota should be available
+			return false, blockReasonNone, time.Time{}
 		}
-		if next.Before(now) {
-			next = now
+		if next.IsZero() || next.Before(now) {
+			next = auth.NextRetryAfter
 		}
 		if auth.Quota.Exceeded {
 			return true, blockReasonCooldown, next
@@ -264,4 +268,20 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, blockReasonOther, next
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+// getEffectiveResetTimeFromState returns the most accurate reset time from QuotaState.
+// It prefers ResetAt over NextRecoverAt, falling back to the provided default.
+func getEffectiveResetTimeFromState(q *QuotaState, fallback time.Time) time.Time {
+	if q == nil {
+		return fallback
+	}
+	// Prefer ResetAt (actual provider reset time) over NextRecoverAt (backoff-based)
+	if !q.ResetAt.IsZero() {
+		return q.ResetAt
+	}
+	if !q.NextRecoverAt.IsZero() {
+		return q.NextRecoverAt
+	}
+	return fallback
 }

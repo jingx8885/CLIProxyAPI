@@ -16,6 +16,7 @@ import (
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/identity"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -131,12 +132,46 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
 	}
 
+	// Apply fingerprint for OAuth accounts (unify multiple users to single identity)
+	var fingerprint *identity.Fingerprint
+	if isClaudeOAuthToken(apiKey) && e.cfg != nil && e.cfg.Fingerprint.Enabled {
+		var ginHeaders http.Header
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			ginHeaders = ginCtx.Request.Header
+		}
+		authID := ""
+		if auth != nil {
+			authID = auth.ID
+		}
+		if authID != "" {
+			fingerprint = identity.GetGlobalService().GetOrCreateFingerprint(authID, ginHeaders)
+			// Rewrite metadata.user_id in body
+			accountUUID := ""
+			if auth != nil && auth.Metadata != nil {
+				if v, ok := auth.Metadata["account_uuid"].(string); ok {
+					accountUUID = v
+				}
+			}
+			if accountUUID != "" && fingerprint != nil && fingerprint.ClientID != "" {
+				if newBody, err := identity.RewriteUserID(bodyForUpstream, authID, accountUUID, fingerprint.ClientID); err == nil && len(newBody) > 0 {
+					bodyForUpstream = newBody
+				}
+			}
+		}
+	}
+
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return resp, err
 	}
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas)
+
+	// Apply fingerprint to request headers (overwrites x-stainless-* headers)
+	if fingerprint != nil {
+		fingerprint.ApplyToRequest(httpReq)
+	}
+
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -262,12 +297,46 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
 	}
 
+	// Apply fingerprint for OAuth accounts (unify multiple users to single identity)
+	var fingerprint *identity.Fingerprint
+	if isClaudeOAuthToken(apiKey) && e.cfg != nil && e.cfg.Fingerprint.Enabled {
+		var ginHeaders http.Header
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			ginHeaders = ginCtx.Request.Header
+		}
+		authID := ""
+		if auth != nil {
+			authID = auth.ID
+		}
+		if authID != "" {
+			fingerprint = identity.GetGlobalService().GetOrCreateFingerprint(authID, ginHeaders)
+			// Rewrite metadata.user_id in body
+			accountUUID := ""
+			if auth != nil && auth.Metadata != nil {
+				if v, ok := auth.Metadata["account_uuid"].(string); ok {
+					accountUUID = v
+				}
+			}
+			if accountUUID != "" && fingerprint != nil && fingerprint.ClientID != "" {
+				if newBody, err := identity.RewriteUserID(bodyForUpstream, authID, accountUUID, fingerprint.ClientID); err == nil && len(newBody) > 0 {
+					bodyForUpstream = newBody
+				}
+			}
+		}
+	}
+
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
 	if err != nil {
 		return nil, err
 	}
 	applyClaudeHeaders(httpReq, auth, apiKey, true, extraBetas)
+
+	// Apply fingerprint to request headers (overwrites x-stainless-* headers)
+	if fingerprint != nil {
+		fingerprint.ApplyToRequest(httpReq)
+	}
+
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -410,12 +479,46 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		body = applyClaudeToolPrefix(body, claudeToolPrefix)
 	}
 
+	// Apply fingerprint for OAuth accounts (unify multiple users to single identity)
+	var fingerprint *identity.Fingerprint
+	if isClaudeOAuthToken(apiKey) && e.cfg != nil && e.cfg.Fingerprint.Enabled {
+		var ginHeaders http.Header
+		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
+			ginHeaders = ginCtx.Request.Header
+		}
+		authID := ""
+		if auth != nil {
+			authID = auth.ID
+		}
+		if authID != "" {
+			fingerprint = identity.GetGlobalService().GetOrCreateFingerprint(authID, ginHeaders)
+			// Rewrite metadata.user_id in body
+			accountUUID := ""
+			if auth != nil && auth.Metadata != nil {
+				if v, ok := auth.Metadata["account_uuid"].(string); ok {
+					accountUUID = v
+				}
+			}
+			if accountUUID != "" && fingerprint != nil && fingerprint.ClientID != "" {
+				if newBody, err := identity.RewriteUserID(body, authID, accountUUID, fingerprint.ClientID); err == nil && len(newBody) > 0 {
+					body = newBody
+				}
+			}
+		}
+	}
+
 	url := fmt.Sprintf("%s/v1/messages/count_tokens?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
 	}
 	applyClaudeHeaders(httpReq, auth, apiKey, false, extraBetas)
+
+	// Apply fingerprint to request headers (overwrites x-stainless-* headers)
+	if fingerprint != nil {
+		fingerprint.ApplyToRequest(httpReq)
+	}
+
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID

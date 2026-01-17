@@ -42,7 +42,13 @@ func (a *QwenAuthenticator) Login(ctx context.Context, cfg *config.Config, opts 
 		opts = &LoginOptions{}
 	}
 
-	authSvc := qwen.NewQwenAuth(cfg)
+	// Create QwenAuth with proxy support if ProxyURL is specified
+	var authSvc *qwen.QwenAuth
+	if opts.ProxyURL != "" {
+		authSvc = qwen.NewQwenAuthWithProxy(opts.ProxyURL)
+	} else {
+		authSvc = qwen.NewQwenAuth(cfg)
+	}
 
 	deviceFlow, err := authSvc.InitiateDeviceFlow(ctx)
 	if err != nil {
@@ -95,11 +101,18 @@ func (a *QwenAuthenticator) Login(ctx context.Context, cfg *config.Config, opts 
 
 	tokenStorage.Email = email
 
-	// no legacy client construction
+	// Save proxy URL to token storage for API requests
+	if opts.ProxyURL != "" {
+		tokenStorage.ProxyURL = opts.ProxyURL
+	}
 
 	fileName := fmt.Sprintf("qwen-%s.json", tokenStorage.Email)
 	metadata := map[string]any{
 		"email": tokenStorage.Email,
+	}
+	// Also store proxy_url in metadata so it gets persisted
+	if opts.ProxyURL != "" {
+		metadata["proxy_url"] = opts.ProxyURL
 	}
 
 	fmt.Println("Qwen authentication successful")
@@ -110,5 +123,6 @@ func (a *QwenAuthenticator) Login(ctx context.Context, cfg *config.Config, opts 
 		FileName: fileName,
 		Storage:  tokenStorage,
 		Metadata: metadata,
+		ProxyURL: opts.ProxyURL,
 	}, nil
 }

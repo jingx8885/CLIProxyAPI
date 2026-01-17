@@ -77,7 +77,13 @@ func (a *CodexAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		}
 	}()
 
-	authSvc := codex.NewCodexAuth(cfg)
+	// Create CodexAuth with proxy support if ProxyURL is specified
+	var authSvc *codex.CodexAuth
+	if opts.ProxyURL != "" {
+		authSvc = codex.NewCodexAuthWithProxy(opts.ProxyURL)
+	} else {
+		authSvc = codex.NewCodexAuth(cfg)
+	}
 
 	authURL, err := authSvc.GenerateAuthURL(state, pkceCodes)
 	if err != nil {
@@ -191,9 +197,18 @@ waitForCallback:
 		return nil, fmt.Errorf("codex token storage missing account information")
 	}
 
+	// Save proxy URL to token storage for API requests
+	if opts.ProxyURL != "" {
+		tokenStorage.ProxyURL = opts.ProxyURL
+	}
+
 	fileName := fmt.Sprintf("codex-%s.json", tokenStorage.Email)
 	metadata := map[string]any{
 		"email": tokenStorage.Email,
+	}
+	// Also store proxy_url in metadata so it gets persisted
+	if opts.ProxyURL != "" {
+		metadata["proxy_url"] = opts.ProxyURL
 	}
 
 	fmt.Println("Codex authentication successful")
@@ -207,5 +222,6 @@ waitForCallback:
 		FileName: fileName,
 		Storage:  tokenStorage,
 		Metadata: metadata,
+		ProxyURL: opts.ProxyURL,
 	}, nil
 }

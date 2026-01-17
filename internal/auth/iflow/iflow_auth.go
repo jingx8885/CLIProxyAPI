@@ -52,6 +52,13 @@ func NewIFlowAuth(cfg *config.Config) *IFlowAuth {
 	return &IFlowAuth{httpClient: util.SetProxy(&cfg.SDKConfig, client)}
 }
 
+// NewIFlowAuthWithProxy constructs a new IFlowAuth with a specific proxy URL.
+// This is used during OAuth login when a per-credential proxy is specified.
+func NewIFlowAuthWithProxy(proxyURL string) *IFlowAuth {
+	client := &http.Client{Timeout: 30 * time.Second}
+	return &IFlowAuth{httpClient: util.SetProxyFromURL(proxyURL, client)}
+}
+
 // AuthorizationURL builds the authorization URL and matching redirect URI.
 func (ia *IFlowAuth) AuthorizationURL(state string, port int) (authURL, redirectURI string) {
 	redirectURI = fmt.Sprintf("http://localhost:%d/oauth2callback", port)

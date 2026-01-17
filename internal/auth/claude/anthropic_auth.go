@@ -63,6 +63,20 @@ func NewClaudeAuth(cfg *config.Config) *ClaudeAuth {
 	}
 }
 
+// NewClaudeAuthWithProxy creates a new Anthropic authentication service with a specific proxy URL.
+// This is used during OAuth login when a per-credential proxy is specified.
+//
+// Parameters:
+//   - proxyURL: The proxy URL string (e.g., socks5://proxy:1080)
+//
+// Returns:
+//   - *ClaudeAuth: A new Claude authentication service instance with proxy configured
+func NewClaudeAuthWithProxy(proxyURL string) *ClaudeAuth {
+	return &ClaudeAuth{
+		httpClient: util.SetProxyFromURL(proxyURL, &http.Client{}),
+	}
+}
+
 // GenerateAuthURL creates the OAuth authorization URL with PKCE.
 // This method generates a secure authorization URL including PKCE challenge codes
 // for the OAuth2 flow with Anthropic's API.

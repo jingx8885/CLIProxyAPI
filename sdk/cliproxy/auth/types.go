@@ -71,10 +71,21 @@ type QuotaState struct {
 	Exceeded bool `json:"exceeded"`
 	// Reason provides an optional provider specific human readable description.
 	Reason string `json:"reason,omitempty"`
-	// NextRecoverAt is when the credential may become available again.
+	// NextRecoverAt is when the credential may become available again (legacy 429 backoff).
 	NextRecoverAt time.Time `json:"next_recover_at"`
 	// BackoffLevel stores the progressive cooldown exponent used for rate limits.
 	BackoffLevel int `json:"backoff_level,omitempty"`
+
+	// Total is the total quota amount (e.g., tokens per period). -1 means unknown.
+	Total int64 `json:"total,omitempty"`
+	// Remaining is the remaining quota amount. -1 means unknown.
+	Remaining int64 `json:"remaining,omitempty"`
+	// ResetAt is the actual quota reset time from the provider (more accurate than NextRecoverAt).
+	ResetAt time.Time `json:"reset_at,omitempty"`
+	// UpdatedAt is when the quota information was last updated.
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+	// Source indicates where the quota info came from (e.g., "api", "429", "header").
+	Source string `json:"source,omitempty"`
 }
 
 // ModelState captures the execution state for a specific model under an auth entry.

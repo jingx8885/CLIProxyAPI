@@ -21,6 +21,8 @@ type IFlowTokenStorage struct {
 	Scope        string `json:"scope"`
 	Cookie       string `json:"cookie"`
 	Type         string `json:"type"`
+	// ProxyURL stores the proxy server URL to be used for API requests with this credential.
+	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
 // SaveTokenToFile serialises the token storage to disk.

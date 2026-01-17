@@ -47,7 +47,13 @@ func (a *IFlowAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		callbackPort = opts.CallbackPort
 	}
 
-	authSvc := iflow.NewIFlowAuth(cfg)
+	// Create IFlowAuth with proxy support if ProxyURL is specified
+	var authSvc *iflow.IFlowAuth
+	if opts.ProxyURL != "" {
+		authSvc = iflow.NewIFlowAuthWithProxy(opts.ProxyURL)
+	} else {
+		authSvc = iflow.NewIFlowAuth(cfg)
+	}
 
 	oauthServer := iflow.NewOAuthServer(callbackPort)
 	if err := oauthServer.Start(); err != nil {
@@ -167,6 +173,11 @@ waitForCallback:
 		return nil, fmt.Errorf("iflow authentication failed: missing account identifier")
 	}
 
+	// Save proxy URL to token storage for API requests
+	if opts.ProxyURL != "" {
+		tokenStorage.ProxyURL = opts.ProxyURL
+	}
+
 	fileName := fmt.Sprintf("iflow-%s-%d.json", email, time.Now().Unix())
 	metadata := map[string]any{
 		"email":         email,
@@ -174,6 +185,10 @@ waitForCallback:
 		"access_token":  tokenStorage.AccessToken,
 		"refresh_token": tokenStorage.RefreshToken,
 		"expired":       tokenStorage.Expire,
+	}
+	// Also store proxy_url in metadata so it gets persisted
+	if opts.ProxyURL != "" {
+		metadata["proxy_url"] = opts.ProxyURL
 	}
 
 	fmt.Println("iFlow authentication successful")
@@ -187,5 +202,6 @@ waitForCallback:
 		Attributes: map[string]string{
 			"api_key": tokenStorage.APIKey,
 		},
+		ProxyURL: opts.ProxyURL,
 	}, nil
 }

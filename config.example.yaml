@@ -22,8 +22,13 @@ remote-management:
   # Leave empty to disable the Management API entirely (404 for all /v0/management routes).
   secret-key: ""
 
-  # Disable the bundled management control panel asset download and HTTP route when true.
+  # Disable the bundled management control panel HTTP route when true.
   disable-control-panel: false
+
+  # Disable automatic download/update of the bundled management control panel.
+  # When true (default), the server will not auto-download updates; if the file is missing, it will attempt a one-time download.
+  # This is independent from disable-control-panel.
+  disable-control-panel-download: true
 
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
   panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
@@ -73,6 +78,13 @@ quota-exceeded:
 # Routing strategy for selecting credentials when multiple match.
 routing:
   strategy: "round-robin" # round-robin (default), fill-first
+
+# Fingerprint unification for OAuth accounts.
+# When enabled, multiple users sharing the same OAuth account will appear as a single user
+# by unifying request headers (User-Agent, X-Stainless-*) and rewriting metadata.user_id.
+# This helps avoid detection when multiple clients use the same OAuth token.
+fingerprint:
+  enabled: false
 
 # Intelligent model routing with fallback candidates.
 # When enabled, you can define virtual model names that map to multiple actual models.

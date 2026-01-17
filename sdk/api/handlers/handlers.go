@@ -747,8 +747,11 @@ func (h *BaseAPIHandler) getRoutingCandidates(modelName string) []string {
 // executeWithRoutingCandidates tries each candidate model in order until one succeeds.
 // It records the successful model for future routing optimization.
 // Implements smart thinking downgrade when routing across incompatible model types.
+// Includes quota-aware filtering to skip candidates with exhausted quotas.
 func (h *BaseAPIHandler) executeWithRoutingCandidates(ctx context.Context, handlerType, originalModel string, rawJSON []byte, alt string, candidates []string, isCount bool) ([]byte, *interfaces.ErrorMessage) {
 	var lastErr *interfaces.ErrorMessage
+	var earliestResetAt time.Time
+	allQuotaBlocked := true
 
 	for i, candidate := range candidates {
 		// Resolve fuzzy candidate pattern to actual model
@@ -766,6 +769,27 @@ func (h *BaseAPIHandler) executeWithRoutingCandidates(ctx context.Context, handl
 			log.Debugf("model routing: candidate '%s' failed to get providers: %v", actualModel, errMsg.Error)
 			lastErr = errMsg
 			continue
+		}
+
+		// Pre-check quota availability for this candidate
+		if h.AuthManager != nil {
+			quotaStatus := h.AuthManager.CheckModelQuotaStatus(providers, normalizedModel)
+			if !quotaStatus.Available && quotaStatus.BlockedCount > 0 {
+				log.Debugf("model routing: candidate '%s' has no available quota (blocked: %d, earliest reset: %v), skipping",
+					actualModel, quotaStatus.BlockedCount, quotaStatus.EarliestResetAt)
+				// Track earliest reset time across all quota-blocked candidates
+				if !quotaStatus.EarliestResetAt.IsZero() {
+					if earliestResetAt.IsZero() || quotaStatus.EarliestResetAt.Before(earliestResetAt) {
+						earliestResetAt = quotaStatus.EarliestResetAt
+					}
+				}
+				continue
+			}
+			if quotaStatus.Available {
+				allQuotaBlocked = false
+			}
+		} else {
+			allQuotaBlocked = false
 		}
 
 		// Smart thinking downgrade: prepare payload for the candidate model
@@ -822,7 +846,22 @@ func (h *BaseAPIHandler) executeWithRoutingCandidates(ctx context.Context, handl
 		return cloneBytes(resp.Payload), nil
 	}
 
-	// All candidates failed
+	// All candidates failed - check if all were quota-blocked
+	if allQuotaBlocked && !earliestResetAt.IsZero() {
+		resetIn := time.Until(earliestResetAt)
+		if resetIn < 0 {
+			resetIn = 0
+		}
+		addon := make(http.Header)
+		addon.Set("Retry-After", fmt.Sprintf("%d", int(resetIn.Seconds())))
+		addon.Set("Content-Type", "application/json")
+		return nil, &interfaces.ErrorMessage{
+			StatusCode: http.StatusTooManyRequests,
+			Error:      fmt.Errorf("all routing candidates for model %s are quota-blocked, retry after %v", originalModel, resetIn.Round(time.Second)),
+			Addon:      addon,
+		}
+	}
+
 	if lastErr != nil {
 		return nil, lastErr
 	}
@@ -831,7 +870,11 @@ func (h *BaseAPIHandler) executeWithRoutingCandidates(ctx context.Context, handl
 
 // executeStreamWithRoutingCandidates tries each candidate model for streaming until one succeeds.
 // Implements smart thinking downgrade when routing across incompatible model types.
+// Includes quota-aware filtering to skip candidates with exhausted quotas.
 func (h *BaseAPIHandler) executeStreamWithRoutingCandidates(ctx context.Context, handlerType, originalModel string, rawJSON []byte, alt string, candidates []string) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
+	var earliestResetAt time.Time
+	allQuotaBlocked := true
+
 	for i, candidate := range candidates {
 		// Resolve fuzzy candidate pattern to actual model
 		actualModel := h.resolveCandidate(candidate)
@@ -847,6 +890,27 @@ func (h *BaseAPIHandler) executeStreamWithRoutingCandidates(ctx context.Context,
 		if errMsg != nil {
 			log.Debugf("model routing stream: candidate '%s' failed to get providers: %v", actualModel, errMsg.Error)
 			continue
+		}
+
+		// Pre-check quota availability for this candidate
+		if h.AuthManager != nil {
+			quotaStatus := h.AuthManager.CheckModelQuotaStatus(providers, normalizedModel)
+			if !quotaStatus.Available && quotaStatus.BlockedCount > 0 {
+				log.Debugf("model routing stream: candidate '%s' has no available quota (blocked: %d, earliest reset: %v), skipping",
+					actualModel, quotaStatus.BlockedCount, quotaStatus.EarliestResetAt)
+				// Track earliest reset time across all quota-blocked candidates
+				if !quotaStatus.EarliestResetAt.IsZero() {
+					if earliestResetAt.IsZero() || quotaStatus.EarliestResetAt.Before(earliestResetAt) {
+						earliestResetAt = quotaStatus.EarliestResetAt
+					}
+				}
+				continue
+			}
+			if quotaStatus.Available {
+				allQuotaBlocked = false
+			}
+		} else {
+			allQuotaBlocked = false
 		}
 
 		// Smart thinking downgrade: prepare payload for the candidate model
@@ -885,9 +949,24 @@ func (h *BaseAPIHandler) executeStreamWithRoutingCandidates(ctx context.Context,
 		return h.wrapStreamWithBootstrapRetry(ctx, providers, req, opts, chunks, originalModel, actualModel, candidates, i)
 	}
 
-	// All candidates failed
+	// All candidates failed - check if all were quota-blocked
 	errChan := make(chan *interfaces.ErrorMessage, 1)
-	errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("all routing candidates failed for model %s", originalModel)}
+	if allQuotaBlocked && !earliestResetAt.IsZero() {
+		resetIn := time.Until(earliestResetAt)
+		if resetIn < 0 {
+			resetIn = 0
+		}
+		addon := make(http.Header)
+		addon.Set("Retry-After", fmt.Sprintf("%d", int(resetIn.Seconds())))
+		addon.Set("Content-Type", "application/json")
+		errChan <- &interfaces.ErrorMessage{
+			StatusCode: http.StatusTooManyRequests,
+			Error:      fmt.Errorf("all routing candidates for model %s are quota-blocked, retry after %v", originalModel, resetIn.Round(time.Second)),
+			Addon:      addon,
+		}
+	} else {
+		errChan <- &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: fmt.Errorf("all routing candidates failed for model %s", originalModel)}
+	}
 	close(errChan)
 	return nil, errChan
 }

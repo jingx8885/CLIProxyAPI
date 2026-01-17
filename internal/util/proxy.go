@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	log "github.com/sirupsen/logrus"
@@ -18,9 +19,27 @@ import (
 // It supports SOCKS5, HTTP, and HTTPS proxies. The function modifies the client's transport
 // to route requests through the configured proxy server.
 func SetProxy(cfg *config.SDKConfig, httpClient *http.Client) *http.Client {
+	if cfg == nil {
+		return httpClient
+	}
+	return SetProxyFromURL(cfg.ProxyURL, httpClient)
+}
+
+// SetProxyFromURL configures the provided HTTP client with proxy settings from the given URL string.
+// It supports SOCKS5, HTTP, and HTTPS proxies with optional authentication.
+// Format: scheme://[user:password@]host:port (e.g., socks5://user:pass@proxy:1080)
+func SetProxyFromURL(proxyURLStr string, httpClient *http.Client) *http.Client {
+	if httpClient == nil {
+		httpClient = &http.Client{}
+	}
+	proxyURLStr = strings.TrimSpace(proxyURLStr)
+	if proxyURLStr == "" {
+		return httpClient
+	}
+
 	var transport *http.Transport
 	// Attempt to parse the proxy URL from the configuration.
-	proxyURL, errParse := url.Parse(cfg.ProxyURL)
+	proxyURL, errParse := url.Parse(proxyURLStr)
 	if errParse == nil {
 		// Handle different proxy schemes.
 		if proxyURL.Scheme == "socks5" {

@@ -22,6 +22,11 @@ type LoginOptions struct {
 	// CallbackPort overrides the local OAuth callback port when set (>0).
 	CallbackPort int
 
+	// ProxyURL specifies the proxy server URL for OAuth login and API requests.
+	// Supports socks5, http, and https schemes with optional authentication.
+	// Format: scheme://[user:password@]host:port (e.g., socks5://proxy:1080)
+	ProxyURL string
+
 	// Prompt allows the caller to provide interactive input when needed.
 	Prompt func(prompt string) (string, error)
 }
@@ -48,6 +53,7 @@ func DoCodexLogin(cfg *config.Config, options *LoginOptions) {
 	authOpts := &sdkAuth.LoginOptions{
 		NoBrowser:    options.NoBrowser,
 		CallbackPort: options.CallbackPort,
+		ProxyURL:     options.ProxyURL,
 		Metadata:     map[string]string{},
 		Prompt:       promptFn,
 	}

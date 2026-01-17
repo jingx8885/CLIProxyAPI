@@ -135,6 +135,9 @@ type Manager struct {
 
 	// Auto refresh state
 	refreshCancel context.CancelFunc
+
+	// quotaCache stores per-auth+model quota information with TTL.
+	quotaCache *QuotaCache
 }
 
 // NewManager constructs a manager with optional custom selector and hook.
@@ -152,6 +155,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		hook:            hook,
 		auths:           make(map[string]*Auth),
 		providerOffsets: make(map[string]int),
+		quotaCache:      NewQuotaCache(5 * time.Minute),
 	}
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
@@ -1297,6 +1301,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	suspendReason := ""
 	clearModelQuota := false
 	setModelQuota := false
+	var quotaResetAt time.Time // Stores the expected quota reset time for registry updates
 
 	m.mu.Lock()
 	if auth, ok := m.auths[result.AuthID]; ok && auth != nil {
@@ -1366,10 +1371,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						Reason:        "quota",
 						NextRecoverAt: next,
 						BackoffLevel:  backoffLevel,
+						Remaining:     0,
+						Total:         -1, // Unknown total
+						ResetAt:       next,
+						UpdatedAt:     now,
+						Source:        "429",
 					}
 					suspendReason = "quota"
 					shouldSuspendModel = true
 					setModelQuota = true
+					quotaResetAt = next
 				case 408, 500, 502, 503, 504:
 					next := now.Add(1 * time.Minute)
 					state.NextRetryAfter = next
@@ -1393,7 +1404,11 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		registry.GetGlobalRegistry().ClearModelQuotaExceeded(result.AuthID, result.Model)
 	}
 	if setModelQuota && result.Model != "" {
-		registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+		if !quotaResetAt.IsZero() {
+			registry.GetGlobalRegistry().SetModelQuotaExceededWithReset(result.AuthID, result.Model, quotaResetAt)
+		} else {
+			registry.GetGlobalRegistry().SetModelQuotaExceeded(result.AuthID, result.Model)
+		}
 	}
 	if shouldResumeModel {
 		registry.GetGlobalRegistry().ResumeClientModel(result.AuthID, result.Model)
@@ -1524,6 +1539,11 @@ func clearAuthStateOnSuccess(auth *Auth, now time.Time) {
 	auth.Quota.Reason = ""
 	auth.Quota.NextRecoverAt = time.Time{}
 	auth.Quota.BackoffLevel = 0
+	auth.Quota.Remaining = -1
+	auth.Quota.Total = -1
+	auth.Quota.ResetAt = time.Time{}
+	auth.Quota.UpdatedAt = now
+	auth.Quota.Source = ""
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
 	auth.UpdatedAt = now
@@ -1609,6 +1629,10 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		auth.StatusMessage = "quota exhausted"
 		auth.Quota.Exceeded = true
 		auth.Quota.Reason = "quota"
+		auth.Quota.Remaining = 0
+		auth.Quota.Total = -1 // Unknown total
+		auth.Quota.Source = "429"
+		auth.Quota.UpdatedAt = now
 		var next time.Time
 		if retryAfter != nil {
 			next = now.Add(*retryAfter)
@@ -1620,6 +1644,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 			auth.Quota.BackoffLevel = nextLevel
 		}
 		auth.Quota.NextRecoverAt = next
+		auth.Quota.ResetAt = next
 		auth.NextRetryAfter = next
 	case 408, 500, 502, 503, 504:
 		auth.StatusMessage = "transient upstream error"
@@ -2373,4 +2398,66 @@ func (m *Manager) HttpRequest(ctx context.Context, auth *Auth, req *http.Request
 		return nil, &Error{Code: "provider_not_found", Message: "executor not registered for provider: " + providerKey}
 	}
 	return exec.HttpRequest(ctx, auth, req)
+}
+
+// ModelQuotaStatus represents the quota availability status for a model.
+type ModelQuotaStatus struct {
+	// Available indicates if any auth has available quota for this model.
+	Available bool
+	// EarliestResetAt is the earliest time when quota might become available again.
+	// Zero if at least one auth is available or no reset time is known.
+	EarliestResetAt time.Time
+	// AvailableCount is the number of auths with available quota.
+	AvailableCount int
+	// BlockedCount is the number of auths blocked due to quota.
+	BlockedCount int
+}
+
+// CheckModelQuotaStatus checks if any auth for the given providers has available quota for the model.
+// This can be used to pre-filter routing candidates before attempting execution.
+func (m *Manager) CheckModelQuotaStatus(providers []string, model string) ModelQuotaStatus {
+	if m == nil || len(providers) == 0 || model == "" {
+		return ModelQuotaStatus{Available: true} // Unknown = assume available
+	}
+
+	now := time.Now()
+	providerSet := make(map[string]struct{}, len(providers))
+	for _, p := range providers {
+		key := strings.TrimSpace(strings.ToLower(p))
+		if key != "" {
+			providerSet[key] = struct{}{}
+		}
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var status ModelQuotaStatus
+	for _, auth := range m.auths {
+		if auth == nil || auth.Disabled {
+			continue
+		}
+		providerKey := strings.TrimSpace(strings.ToLower(auth.Provider))
+		if _, ok := providerSet[providerKey]; !ok {
+			continue
+		}
+
+		blocked, reason, next := isAuthBlockedForModel(auth, model, now)
+		if !blocked {
+			status.Available = true
+			status.AvailableCount++
+			continue
+		}
+
+		if reason == blockReasonCooldown {
+			status.BlockedCount++
+			if !next.IsZero() {
+				if status.EarliestResetAt.IsZero() || next.Before(status.EarliestResetAt) {
+					status.EarliestResetAt = next
+				}
+			}
+		}
+	}
+
+	return status
 }

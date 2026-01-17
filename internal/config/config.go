@@ -112,6 +112,11 @@ type Config struct {
 	// ModelRouting defines intelligent model routing with fallback candidates.
 	ModelRouting ModelRoutingConfig `yaml:"model-routing,omitempty" json:"model-routing,omitempty"`
 
+	// Fingerprint controls request fingerprint unification for OAuth accounts.
+	// When enabled, multiple users sharing the same OAuth account will appear as a single user
+	// by unifying request headers (User-Agent, X-Stainless-*) and rewriting metadata.user_id.
+	Fingerprint FingerprintConfig `yaml:"fingerprint" json:"fingerprint"`
+
 	legacyMigrationPending bool `yaml:"-" json:"-"`
 }
 
@@ -125,14 +130,24 @@ type TLSConfig struct {
 	Key string `yaml:"key" json:"key"`
 }
 
+// FingerprintConfig controls request fingerprint unification for OAuth accounts.
+type FingerprintConfig struct {
+	// Enabled toggles fingerprint unification for OAuth accounts.
+	// When true, multiple users sharing the same OAuth account will appear as a single user
+	// by unifying request headers (User-Agent, X-Stainless-*) and rewriting metadata.user_id.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+}
+
 // RemoteManagement holds management API configuration under 'remote-management'.
 type RemoteManagement struct {
 	// AllowRemote toggles remote (non-localhost) access to management API.
 	AllowRemote bool `yaml:"allow-remote"`
 	// SecretKey is the management key (plaintext or bcrypt hashed). YAML key intentionally 'secret-key'.
 	SecretKey string `yaml:"secret-key"`
-	// DisableControlPanel skips serving and syncing the bundled management UI when true.
+	// DisableControlPanel skips serving the bundled management UI when true.
 	DisableControlPanel bool `yaml:"disable-control-panel"`
+	// DisableControlPanelDownload skips automatic download/update of the bundled management UI when true.
+	DisableControlPanelDownload bool `yaml:"disable-control-panel-download"`
 	// PanelGitHubRepository overrides the GitHub repository used to fetch the management panel asset.
 	// Accepts either a repository URL (https://github.com/org/repo) or an API releases endpoint.
 	PanelGitHubRepository string `yaml:"panel-github-repository"`
@@ -534,6 +549,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
 	cfg.AmpCode.RestrictManagementToLocalhost = false // Default to false: API key auth is sufficient
+	cfg.RemoteManagement.DisableControlPanelDownload = true
 	cfg.RemoteManagement.PanelGitHubRepository = DefaultPanelGitHubRepository
 	if err = yaml.Unmarshal(data, &cfg); err != nil {
 		if optional {

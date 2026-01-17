@@ -47,10 +47,16 @@ func (a *GeminiAuthenticator) Login(ctx context.Context, cfg *config.Config, opt
 	_, err := geminiAuth.GetAuthenticatedClient(ctx, &ts, cfg, &gemini.WebLoginOptions{
 		NoBrowser:    opts.NoBrowser,
 		CallbackPort: opts.CallbackPort,
+		ProxyURL:     opts.ProxyURL,
 		Prompt:       opts.Prompt,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("gemini authentication failed: %w", err)
+	}
+
+	// Save proxy URL to token storage for API requests
+	if opts.ProxyURL != "" {
+		ts.ProxyURL = opts.ProxyURL
 	}
 
 	// Skip onboarding here; rely on upstream configuration
@@ -59,6 +65,10 @@ func (a *GeminiAuthenticator) Login(ctx context.Context, cfg *config.Config, opt
 	metadata := map[string]any{
 		"email":      ts.Email,
 		"project_id": ts.ProjectID,
+	}
+	// Also store proxy_url in metadata so it gets persisted
+	if opts.ProxyURL != "" {
+		metadata["proxy_url"] = opts.ProxyURL
 	}
 
 	fmt.Println("Gemini authentication successful")
@@ -69,5 +79,6 @@ func (a *GeminiAuthenticator) Login(ctx context.Context, cfg *config.Config, opt
 		FileName: fileName,
 		Storage:  &ts,
 		Metadata: metadata,
+		ProxyURL: opts.ProxyURL,
 	}, nil
 }

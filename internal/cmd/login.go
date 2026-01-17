@@ -70,6 +70,7 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 		NoBrowser:    options.NoBrowser,
 		ProjectID:    trimmedProjectID,
 		CallbackPort: options.CallbackPort,
+		ProxyURL:     options.ProxyURL,
 		Metadata:     map[string]string{},
 		Prompt:       callbackPrompt,
 	}
@@ -91,6 +92,7 @@ func DoLogin(cfg *config.Config, projectID string, options *LoginOptions) {
 	httpClient, errClient := geminiAuth.GetAuthenticatedClient(ctx, storage, cfg, &gemini.WebLoginOptions{
 		NoBrowser:    options.NoBrowser,
 		CallbackPort: options.CallbackPort,
+		ProxyURL:     options.ProxyURL,
 		Prompt:       callbackPrompt,
 	})
 	if errClient != nil {

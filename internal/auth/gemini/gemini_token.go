@@ -35,6 +35,9 @@ type GeminiTokenStorage struct {
 
 	// Type indicates the authentication provider type, always "gemini" for this storage.
 	Type string `json:"type"`
+
+	// ProxyURL stores the proxy server URL to be used for API requests with this credential.
+	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
 // SaveTokenToFile serializes the Gemini token storage to a JSON file.

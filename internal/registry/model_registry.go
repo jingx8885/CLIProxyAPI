@@ -82,7 +82,9 @@ type ModelRegistration struct {
 	Count int
 	// LastUpdated tracks when this registration was last modified
 	LastUpdated time.Time
-	// QuotaExceededClients tracks which clients have exceeded quota for this model
+	// QuotaExceededClients tracks which clients have exceeded quota for this model.
+	// The value is the expected reset time (when quota should become available again).
+	// If the time has passed, the client is considered available.
 	QuotaExceededClients map[string]*time.Time
 	// Providers tracks available clients grouped by provider identifier
 	Providers map[string]int
@@ -561,18 +563,27 @@ func (r *ModelRegistry) unregisterClientInternal(clientID string) {
 	r.triggerModelsUnregistered(provider, clientID)
 }
 
-// SetModelQuotaExceeded marks a model as quota exceeded for a specific client
+// SetModelQuotaExceeded marks a model as quota exceeded for a specific client.
+// Uses a default recovery time of 5 minutes from now.
 // Parameters:
 //   - clientID: The client that exceeded quota
 //   - modelID: The model that exceeded quota
 func (r *ModelRegistry) SetModelQuotaExceeded(clientID, modelID string) {
+	r.SetModelQuotaExceededWithReset(clientID, modelID, time.Now().Add(5*time.Minute))
+}
+
+// SetModelQuotaExceededWithReset marks a model as quota exceeded with a specific reset time.
+// Parameters:
+//   - clientID: The client that exceeded quota
+//   - modelID: The model that exceeded quota
+//   - resetAt: The time when quota is expected to become available again
+func (r *ModelRegistry) SetModelQuotaExceededWithReset(clientID, modelID string, resetAt time.Time) {
 	r.mutex.Lock()
 	defer r.mutex.Unlock()
 
 	if registration, exists := r.models[modelID]; exists {
-		now := time.Now()
-		registration.QuotaExceededClients[clientID] = &now
-		log.Debugf("Marked model %s as quota exceeded for client %s", modelID, clientID)
+		registration.QuotaExceededClients[clientID] = &resetAt
+		log.Debugf("Marked model %s as quota exceeded for client %s (reset at: %v)", modelID, clientID, resetAt)
 	}
 }
 
@@ -680,19 +691,22 @@ func (r *ModelRegistry) GetAvailableModels(handlerType string) []map[string]any 
 	defer r.mutex.RUnlock()
 
 	models := make([]map[string]any, 0)
-	quotaExpiredDuration := 5 * time.Minute
+	now := time.Now()
 
 	for _, registration := range r.models {
 		// Check if model has any non-quota-exceeded clients
 		availableClients := registration.Count
-		now := time.Now()
 
-		// Count clients that have exceeded quota but haven't recovered yet
+		// Count clients that have exceeded quota and haven't recovered yet.
+		// QuotaExceededClients now stores the reset time (when quota becomes available).
+		// If reset time has passed, the client is considered available.
 		expiredClients := 0
-		for _, quotaTime := range registration.QuotaExceededClients {
-			if quotaTime != nil && now.Sub(*quotaTime) < quotaExpiredDuration {
+		for _, resetAt := range registration.QuotaExceededClients {
+			if resetAt != nil && resetAt.After(now) {
+				// Reset time is in the future, client is still quota-blocked
 				expiredClients++
 			}
+			// If resetAt is nil or in the past, client is considered recovered
 		}
 
 		cooldownSuspended := 0

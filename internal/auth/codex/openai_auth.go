@@ -41,6 +41,20 @@ func NewCodexAuth(cfg *config.Config) *CodexAuth {
 	}
 }
 
+// NewCodexAuthWithProxy creates a new CodexAuth service instance with a specific proxy URL.
+// This is used during OAuth login when a per-credential proxy is specified.
+//
+// Parameters:
+//   - proxyURL: The proxy URL string (e.g., socks5://proxy:1080)
+//
+// Returns:
+//   - *CodexAuth: A new Codex authentication service instance with proxy configured
+func NewCodexAuthWithProxy(proxyURL string) *CodexAuth {
+	return &CodexAuth{
+		httpClient: util.SetProxyFromURL(proxyURL, &http.Client{}),
+	}
+}
+
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).
 // It constructs the URL with the necessary parameters, including the client ID,
 // response type, redirect URI, scopes, and PKCE challenge.

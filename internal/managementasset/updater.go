@@ -38,10 +38,12 @@ var (
 	lastUpdateCheckMu   sync.Mutex
 	lastUpdateCheckTime time.Time
 
-	currentConfigPtr    atomic.Pointer[config.Config]
-	disableControlPanel atomic.Bool
-	schedulerOnce       sync.Once
-	schedulerConfigPath atomic.Value
+	currentConfigPtr            atomic.Pointer[config.Config]
+	disableControlPanel         atomic.Bool
+	disableControlPanelDownload atomic.Bool
+	downloadDisabledOnce        atomic.Bool
+	schedulerOnce               sync.Once
+	schedulerConfigPath         atomic.Value
 )
 
 // SetCurrentConfig stores the latest configuration snapshot for management asset decisions.
@@ -52,13 +54,24 @@ func SetCurrentConfig(cfg *config.Config) {
 	}
 
 	prevDisabled := disableControlPanel.Load()
+	prevDownloadDisabled := disableControlPanelDownload.Load()
 	currentConfigPtr.Store(cfg)
 	disableControlPanel.Store(cfg.RemoteManagement.DisableControlPanel)
+	disableControlPanelDownload.Store(cfg.RemoteManagement.DisableControlPanelDownload)
 
 	if prevDisabled && !cfg.RemoteManagement.DisableControlPanel {
 		lastUpdateCheckMu.Lock()
 		lastUpdateCheckTime = time.Time{}
 		lastUpdateCheckMu.Unlock()
+	}
+
+	if prevDownloadDisabled != cfg.RemoteManagement.DisableControlPanelDownload {
+		if !cfg.RemoteManagement.DisableControlPanelDownload {
+			lastUpdateCheckMu.Lock()
+			lastUpdateCheckTime = time.Time{}
+			lastUpdateCheckMu.Unlock()
+		}
+		downloadDisabledOnce.Store(false)
 	}
 }
 
@@ -96,10 +109,14 @@ func runAutoUpdater(ctx context.Context) {
 			log.Debug("management asset auto-updater skipped: control panel disabled")
 			return
 		}
+		if disableControlPanelDownload.Load() {
+			log.Debug("management asset auto-updater skipped: control panel download disabled")
+			return
+		}
 
 		configPath, _ := schedulerConfigPath.Load().(string)
 		staticDir := StaticDir(configPath)
-		EnsureLatestManagementHTML(ctx, staticDir, cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository)
+		EnsureLatestManagementHTML(ctx, staticDir, cfg.ProxyURL, cfg.RemoteManagement.PanelGitHubRepository, false)
 	}
 
 	runOnce()
@@ -183,7 +200,8 @@ func FilePath(configFilePath string) string {
 // EnsureLatestManagementHTML checks the latest management.html asset and updates the local copy when needed.
 // The function is designed to run in a background goroutine and will never panic.
 // It enforces a 3-hour rate limit to avoid frequent checks on config/auth file changes.
-func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string, panelRepository string) {
+// When force is true, a single download attempt is allowed even if downloads are disabled.
+func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL string, panelRepository string, force bool) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -191,6 +209,18 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	if disableControlPanel.Load() {
 		log.Debug("management asset sync skipped: control panel disabled by configuration")
 		return
+	}
+
+	downloadDisabled := disableControlPanelDownload.Load()
+	if downloadDisabled {
+		if !force {
+			log.Debug("management asset sync skipped: control panel download disabled by configuration")
+			return
+		}
+		if !downloadDisabledOnce.CompareAndSwap(false, true) {
+			log.Debug("management asset sync skipped: control panel download disabled and already attempted")
+			return
+		}
 	}
 
 	staticDir = strings.TrimSpace(staticDir)
@@ -210,16 +240,18 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 	}
 
 	// Rate limiting: check only once every 3 hours
-	lastUpdateCheckMu.Lock()
-	now := time.Now()
-	timeSinceLastCheck := now.Sub(lastUpdateCheckTime)
-	if timeSinceLastCheck < updateCheckInterval {
+	if !(downloadDisabled && force) {
+		lastUpdateCheckMu.Lock()
+		now := time.Now()
+		timeSinceLastCheck := now.Sub(lastUpdateCheckTime)
+		if timeSinceLastCheck < updateCheckInterval {
+			lastUpdateCheckMu.Unlock()
+			log.Debugf("management asset update check skipped: last check was %v ago (interval: %v)", timeSinceLastCheck.Round(time.Second), updateCheckInterval)
+			return
+		}
+		lastUpdateCheckTime = now
 		lastUpdateCheckMu.Unlock()
-		log.Debugf("management asset update check skipped: last check was %v ago (interval: %v)", timeSinceLastCheck.Round(time.Second), updateCheckInterval)
-		return
 	}
-	lastUpdateCheckTime = now
-	lastUpdateCheckMu.Unlock()
 
 	if errMkdirAll := os.MkdirAll(staticDir, 0o755); errMkdirAll != nil {
 		log.WithError(errMkdirAll).Warn("failed to prepare static directory for management asset")

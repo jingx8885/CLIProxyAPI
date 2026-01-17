@@ -24,6 +24,7 @@ var (
 type ConvertCodexResponseToClaudeParams struct {
 	HasToolCall bool
 	BlockIndex  int
+	HasContent  bool // Tracks whether any content (text, thinking, or tool use) has been output
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -47,6 +48,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		*param = &ConvertCodexResponseToClaudeParams{
 			HasToolCall: false,
 			BlockIndex:  0,
+			HasContent:  false,
 		}
 	}
 
@@ -71,6 +73,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	} else if typeStr == "response.reasoning_summary_part.added" {
 		template = `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
 		template, _ = sjson.Set(template, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
+		(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
 
 		output = "event: content_block_start\n"
 		output += fmt.Sprintf("data: %s\n\n", template)
@@ -92,6 +95,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	} else if typeStr == "response.content_part.added" {
 		template = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
 		template, _ = sjson.Set(template, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
+		(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
 
 		output = "event: content_block_start\n"
 		output += fmt.Sprintf("data: %s\n\n", template)
@@ -110,6 +114,13 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		output = "event: content_block_stop\n"
 		output += fmt.Sprintf("data: %s\n\n", template)
 	} else if typeStr == "response.completed" {
+		// Only send message_delta and message_stop if we have actually output content
+		// This prevents "No assistant messages found" error in Claude Code when the model
+		// returns an empty response (only response.created + response.completed without content)
+		if !(*param).(*ConvertCodexResponseToClaudeParams).HasContent {
+			return []string{}
+		}
+
 		template = `{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`
 		p := (*param).(*ConvertCodexResponseToClaudeParams).HasToolCall
 		if p {
@@ -130,6 +141,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		itemType := itemResult.Get("type").String()
 		if itemType == "function_call" {
 			(*param).(*ConvertCodexResponseToClaudeParams).HasToolCall = true
+			(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
 			template = `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
 			template, _ = sjson.Set(template, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
 			template, _ = sjson.Set(template, "content_block.id", itemResult.Get("call_id").String())

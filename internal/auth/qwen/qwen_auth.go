@@ -89,6 +89,14 @@ func NewQwenAuth(cfg *config.Config) *QwenAuth {
 	}
 }
 
+// NewQwenAuthWithProxy creates a new QwenAuth instance with a specific proxy URL.
+// This is used during OAuth login when a per-credential proxy is specified.
+func NewQwenAuthWithProxy(proxyURL string) *QwenAuth {
+	return &QwenAuth{
+		httpClient: util.SetProxyFromURL(proxyURL, &http.Client{}),
+	}
+}
+
 // generateCodeVerifier generates a cryptographically random string for the PKCE code verifier.
 func (qa *QwenAuth) generateCodeVerifier() (string, error) {
 	bytes := make([]byte, 32)

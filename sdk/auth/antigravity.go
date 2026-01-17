@@ -65,7 +65,13 @@ func (AntigravityAuthenticator) Login(ctx context.Context, cfg *config.Config, o
 		callbackPort = opts.CallbackPort
 	}
 
-	httpClient := util.SetProxy(&cfg.SDKConfig, &http.Client{})
+	// Create HTTP client with proxy support if ProxyURL is specified
+	var httpClient *http.Client
+	if opts.ProxyURL != "" {
+		httpClient = util.SetProxyFromURL(opts.ProxyURL, &http.Client{})
+	} else {
+		httpClient = util.SetProxy(&cfg.SDKConfig, &http.Client{})
+	}
 
 	state, err := misc.GenerateRandomState()
 	if err != nil {
@@ -203,6 +209,10 @@ waitForCallback:
 	if projectID != "" {
 		metadata["project_id"] = projectID
 	}
+	// Store proxy_url in metadata so it gets persisted
+	if opts.ProxyURL != "" {
+		metadata["proxy_url"] = opts.ProxyURL
+	}
 
 	fileName := sanitizeAntigravityFileName(email)
 	label := email
@@ -220,6 +230,7 @@ waitForCallback:
 		FileName: fileName,
 		Label:    label,
 		Metadata: metadata,
+		ProxyURL: opts.ProxyURL,
 	}, nil
 }
 

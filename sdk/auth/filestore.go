@@ -233,6 +233,10 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}
+	// Read proxy_url from metadata and set it on Auth
+	if proxyURL, ok := metadata["proxy_url"].(string); ok && proxyURL != "" {
+		auth.ProxyURL = strings.TrimSpace(proxyURL)
+	}
 	return auth, nil
 }
 
