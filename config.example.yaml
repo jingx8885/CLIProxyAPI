@@ -77,11 +77,27 @@ routing:
 # Intelligent model routing with fallback candidates.
 # When enabled, you can define virtual model names that map to multiple actual models.
 # The router will try each candidate in order until one succeeds.
+#
+# Smart Thinking Downgrade:
+# When routing across different model types (e.g., Claude -> Gemini), the router
+# automatically downgrades thinking blocks to regular text to prevent compatibility
+# errors like "Corrupted thought signature". This follows Antigravity-Manager's strategy.
+#
 # model-routing:
 #   enabled: true
 #   auto-search: true  # Auto-search all providers for models matching the base name
 #                      # e.g., "Claude-sonnet-20251124" -> searches for all "*Claude-sonnet*" models
 #   cache-file: "model-routing-cache.json"  # Persists successful routes (relative to auth-dir)
+#
+#   # Native provider priority: when auto-search finds multiple candidates,
+#   # sort them by preferred provider for each model family.
+#   # This ensures GPT models prefer codex over antigravity, etc.
+#   native-provider-priority:
+#     gpt: ["codex", "antigravity", "openai-compatibility"]
+#     claude: ["claude", "antigravity", "vertex", "gemini"]
+#     gemini: ["gemini", "vertex"]
+#     qwen: ["qwen", "antigravity"]
+#
 #   routes:
 #     # Explicit routes take priority over auto-search
 #     # Exact match: request "claude-sonnet" tries these models in order

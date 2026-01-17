@@ -267,6 +267,17 @@ type ModelRoutingConfig struct {
 	// If empty, defaults to "model-routing-cache.json".
 	CacheFile string `yaml:"cache-file,omitempty" json:"cache-file,omitempty"`
 
+	// NativeProviderPriority defines the preferred provider order for each model family.
+	// When auto-search finds multiple candidates, they are sorted by this priority.
+	// Keys are model family names (e.g., "gpt", "claude", "gemini").
+	// Values are ordered lists of provider names (e.g., ["codex", "antigravity"]).
+	// Example:
+	//   native-provider-priority:
+	//     gpt: ["codex", "antigravity", "openai-compatibility"]
+	//     claude: ["claude", "antigravity", "vertex", "gemini"]
+	//     gemini: ["gemini", "vertex"]
+	NativeProviderPriority map[string][]string `yaml:"native-provider-priority,omitempty" json:"native-provider-priority,omitempty"`
+
 	// Routes defines the routing rules mapping virtual model names to candidate models.
 	Routes []ModelRouteEntry `yaml:"routes,omitempty" json:"routes,omitempty"`
 }

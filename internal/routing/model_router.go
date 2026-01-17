@@ -4,6 +4,7 @@
 package routing
 
 import (
+	"sort"
 	"strings"
 	"sync"
 
@@ -146,9 +147,17 @@ func (r *ModelRouter) GetCandidates(modelName string) []string {
 	return nil
 }
 
+// candidateInfo holds information about a candidate model for sorting.
+type candidateInfo struct {
+	modelID   string
+	providers []string
+	modelType string // "claude", "gemini", "openai", etc.
+}
+
 // autoSearchModels searches the model registry for models containing the given name.
 // It extracts the base model name (removing version suffixes like -20251124) and
 // searches for all models containing that base name across all providers.
+// Results are sorted by native provider priority if configured.
 func (r *ModelRouter) autoSearchModels(modelName string) []string {
 	// Extract base model name by removing common version suffixes
 	baseName := extractBaseModelName(modelName)
@@ -160,7 +169,8 @@ func (r *ModelRouter) autoSearchModels(modelName string) []string {
 	reg := registry.GetGlobalRegistry()
 	allModels := reg.GetAvailableModels("")
 
-	var candidates []string
+	// Collect candidates with their provider info
+	var candidatesInfo []candidateInfo
 	seen := make(map[string]struct{})
 
 	for _, model := range allModels {
@@ -172,14 +182,31 @@ func (r *ModelRouter) autoSearchModels(modelName string) []string {
 		// Check if model ID contains the base name (case-insensitive)
 		if strings.Contains(strings.ToLower(modelID), lowerBase) {
 			// Verify the model has providers
-			if len(util.GetProviderName(modelID)) > 0 {
+			providers := util.GetProviderName(modelID)
+			if len(providers) > 0 {
 				if _, exists := seen[modelID]; !exists {
 					seen[modelID] = struct{}{}
-					candidates = append(candidates, modelID)
+					// Get model type from registry
+					modelType := ""
+					if info := registry.LookupModelInfo(modelID); info != nil {
+						modelType = info.Type
+					}
+					candidatesInfo = append(candidatesInfo, candidateInfo{
+						modelID:   modelID,
+						providers: providers,
+						modelType: modelType,
+					})
 				}
 			}
 		}
 	}
+
+	if len(candidatesInfo) == 0 {
+		return nil
+	}
+
+	// Sort candidates by native provider priority
+	candidates := r.sortCandidatesByProviderPriority(candidatesInfo, baseName)
 
 	if len(candidates) > 0 {
 		log.Debugf("model router: auto-search for '%s' (base: '%s') found %d candidates: %v",
@@ -187,6 +214,95 @@ func (r *ModelRouter) autoSearchModels(modelName string) []string {
 	}
 
 	return candidates
+}
+
+// sortCandidatesByProviderPriority sorts candidates based on configured provider priority.
+// It determines the model family from the base name and sorts accordingly.
+func (r *ModelRouter) sortCandidatesByProviderPriority(candidates []candidateInfo, baseName string) []string {
+	// Determine model family from base name
+	family := inferModelFamily(baseName)
+
+	// Get priority list for this family
+	var priorityList []string
+	if r.cfg != nil && r.cfg.NativeProviderPriority != nil {
+		priorityList = r.cfg.NativeProviderPriority[family]
+	}
+
+	// If no priority configured, return unsorted
+	if len(priorityList) == 0 {
+		result := make([]string, len(candidates))
+		for i, c := range candidates {
+			result[i] = c.modelID
+		}
+		return result
+	}
+
+	// Create priority map for O(1) lookup
+	priorityMap := make(map[string]int)
+	for i, provider := range priorityList {
+		priorityMap[provider] = i
+	}
+
+	// Sort candidates by provider priority
+	sort.SliceStable(candidates, func(i, j int) bool {
+		// Get best (lowest) priority for each candidate
+		iPriority := getBestProviderPriority(candidates[i].providers, priorityMap)
+		jPriority := getBestProviderPriority(candidates[j].providers, priorityMap)
+		return iPriority < jPriority
+	})
+
+	// Extract sorted model IDs
+	result := make([]string, len(candidates))
+	for i, c := range candidates {
+		result[i] = c.modelID
+	}
+
+	log.Debugf("model router: sorted candidates by provider priority (family: %s, priority: %v)", family, priorityList)
+	return result
+}
+
+// inferModelFamily determines the model family from a base model name.
+// Returns "claude", "gpt", "gemini", or empty string if unknown.
+func inferModelFamily(baseName string) string {
+	lower := strings.ToLower(baseName)
+
+	// Check for Claude models
+	if strings.Contains(lower, "claude") || strings.Contains(lower, "sonnet") ||
+		strings.Contains(lower, "opus") || strings.Contains(lower, "haiku") {
+		return "claude"
+	}
+
+	// Check for GPT/OpenAI models
+	if strings.Contains(lower, "gpt") || strings.Contains(lower, "o1") ||
+		strings.Contains(lower, "o3") || strings.Contains(lower, "codex") {
+		return "gpt"
+	}
+
+	// Check for Gemini models
+	if strings.Contains(lower, "gemini") {
+		return "gemini"
+	}
+
+	// Check for Qwen models
+	if strings.Contains(lower, "qwen") {
+		return "qwen"
+	}
+
+	return ""
+}
+
+// getBestProviderPriority returns the lowest (best) priority among the providers.
+// Returns a high value if none of the providers are in the priority map.
+func getBestProviderPriority(providers []string, priorityMap map[string]int) int {
+	best := 9999 // High value for unprioritized providers
+	for _, provider := range providers {
+		if priority, ok := priorityMap[provider]; ok {
+			if priority < best {
+				best = priority
+			}
+		}
+	}
+	return best
 }
 
 // extractBaseModelName extracts the base model name by removing version suffixes.

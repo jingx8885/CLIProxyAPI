@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/routing"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -745,6 +746,7 @@ func (h *BaseAPIHandler) getRoutingCandidates(modelName string) []string {
 
 // executeWithRoutingCandidates tries each candidate model in order until one succeeds.
 // It records the successful model for future routing optimization.
+// Implements smart thinking downgrade when routing across incompatible model types.
 func (h *BaseAPIHandler) executeWithRoutingCandidates(ctx context.Context, handlerType, originalModel string, rawJSON []byte, alt string, candidates []string, isCount bool) ([]byte, *interfaces.ErrorMessage) {
 	var lastErr *interfaces.ErrorMessage
 
@@ -766,10 +768,17 @@ func (h *BaseAPIHandler) executeWithRoutingCandidates(ctx context.Context, handl
 			continue
 		}
 
+		// Smart thinking downgrade: prepare payload for the candidate model
+		targetProvider := ""
+		if len(providers) > 0 {
+			targetProvider = providers[0]
+		}
+		preparedPayload := h.preparePayloadForCandidate(originalModel, actualModel, rawJSON, targetProvider)
+
 		reqMeta := requestExecutionMetadata(ctx)
 		req := coreexecutor.Request{
 			Model:   normalizedModel,
-			Payload: cloneBytes(rawJSON),
+			Payload: preparedPayload,
 		}
 		opts := coreexecutor.Options{
 			Stream:          false,
@@ -821,6 +830,7 @@ func (h *BaseAPIHandler) executeWithRoutingCandidates(ctx context.Context, handl
 }
 
 // executeStreamWithRoutingCandidates tries each candidate model for streaming until one succeeds.
+// Implements smart thinking downgrade when routing across incompatible model types.
 func (h *BaseAPIHandler) executeStreamWithRoutingCandidates(ctx context.Context, handlerType, originalModel string, rawJSON []byte, alt string, candidates []string) (<-chan []byte, <-chan *interfaces.ErrorMessage) {
 	for i, candidate := range candidates {
 		// Resolve fuzzy candidate pattern to actual model
@@ -839,10 +849,17 @@ func (h *BaseAPIHandler) executeStreamWithRoutingCandidates(ctx context.Context,
 			continue
 		}
 
+		// Smart thinking downgrade: prepare payload for the candidate model
+		targetProvider := ""
+		if len(providers) > 0 {
+			targetProvider = providers[0]
+		}
+		preparedPayload := h.preparePayloadForCandidate(originalModel, actualModel, rawJSON, targetProvider)
+
 		reqMeta := requestExecutionMetadata(ctx)
 		req := coreexecutor.Request{
 			Model:   normalizedModel,
-			Payload: cloneBytes(rawJSON),
+			Payload: preparedPayload,
 		}
 		opts := coreexecutor.Options{
 			Stream:          true,
@@ -975,4 +992,98 @@ func (h *BaseAPIHandler) resolveCandidate(candidate string) string {
 // SetModelRouter sets the model router for intelligent routing.
 func (h *BaseAPIHandler) SetModelRouter(router *routing.ModelRouter) {
 	h.ModelRouter = router
+}
+
+// preparePayloadForCandidate prepares the request payload for a candidate model.
+// It implements smart thinking downgrade when routing across incompatible model types.
+// This follows Antigravity-Manager's strategy of preserving thinking content as text
+// rather than discarding it entirely.
+//
+// Decision tree:
+// 1. If target model doesn't support thinking -> downgrade thinking to text
+// 2. If cross-model-type routing (e.g., Claude -> Gemini) -> downgrade thinking to text
+// 3. Otherwise -> preserve original payload
+func (h *BaseAPIHandler) preparePayloadForCandidate(originalModel, candidateModel string, rawJSON []byte, targetProvider string) []byte {
+	// Get model type information
+	originalType := getModelType(originalModel)
+	candidateType := getModelType(candidateModel)
+
+	// Check if target model supports thinking
+	targetSupportsThinking := doesModelSupportThinking(candidateModel)
+
+	// Check if this is cross-model-type routing
+	isCrossType := originalType != "" && candidateType != "" && originalType != candidateType
+
+	// Determine if downgrade is needed
+	needsDowngrade := !targetSupportsThinking || isCrossType
+
+	if !needsDowngrade {
+		return cloneBytes(rawJSON) // No downgrade needed, preserve original
+	}
+
+	log.Debugf("model routing: smart thinking downgrade for %s -> %s (cross-type: %v, target-supports-thinking: %v)",
+		originalModel, candidateModel, isCrossType, targetSupportsThinking)
+
+	// Perform intelligent downgrade
+	return thinking.DowngradeThinkingToText(rawJSON, targetProvider)
+}
+
+// getModelType returns the model family type (e.g., "claude", "gemini", "openai").
+// It first checks the registry, then falls back to name-based inference.
+func getModelType(modelName string) string {
+	// Try to get type from registry
+	if info := registry.LookupModelInfo(modelName); info != nil && info.Type != "" {
+		return strings.ToLower(info.Type)
+	}
+
+	// Fallback: infer from model name
+	lower := strings.ToLower(modelName)
+
+	if strings.Contains(lower, "claude") || strings.Contains(lower, "sonnet") ||
+		strings.Contains(lower, "opus") || strings.Contains(lower, "haiku") {
+		return "claude"
+	}
+
+	if strings.Contains(lower, "gemini") {
+		return "gemini"
+	}
+
+	if strings.Contains(lower, "gpt") || strings.Contains(lower, "o1") ||
+		strings.Contains(lower, "o3") || strings.Contains(lower, "codex") {
+		return "openai"
+	}
+
+	if strings.Contains(lower, "qwen") {
+		return "qwen"
+	}
+
+	return ""
+}
+
+// doesModelSupportThinking checks if a model supports thinking mode.
+// This follows Antigravity-Manager's logic:
+// - Claude models support thinking
+// - Models with "-thinking" suffix support thinking
+// - Regular Gemini models (without -thinking) do NOT support thinking
+func doesModelSupportThinking(modelName string) bool {
+	lower := strings.ToLower(modelName)
+
+	// Claude models support thinking
+	if strings.Contains(lower, "claude") || strings.Contains(lower, "sonnet") ||
+		strings.Contains(lower, "opus") || strings.Contains(lower, "haiku") {
+		return true
+	}
+
+	// Models with -thinking suffix support thinking
+	if strings.Contains(lower, "-thinking") {
+		return true
+	}
+
+	// Check ModelInfo.Thinking field from registry
+	if info := registry.LookupModelInfo(modelName); info != nil && info.Thinking != nil {
+		return true
+	}
+
+	// Default: doesn't support thinking
+	return false
 }
