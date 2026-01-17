@@ -1063,6 +1063,8 @@ func getModelType(modelName string) string {
 // doesModelSupportThinking checks if a model supports thinking mode.
 // This follows Antigravity-Manager's logic:
 // - Claude models support thinking
+// - OpenAI o1/o3 models support thinking (reasoning)
+// - Codex models support thinking
 // - Models with "-thinking" suffix support thinking
 // - Regular Gemini models (without -thinking) do NOT support thinking
 func doesModelSupportThinking(modelName string) bool {
@@ -1071,6 +1073,24 @@ func doesModelSupportThinking(modelName string) bool {
 	// Claude models support thinking
 	if strings.Contains(lower, "claude") || strings.Contains(lower, "sonnet") ||
 		strings.Contains(lower, "opus") || strings.Contains(lower, "haiku") {
+		return true
+	}
+
+	// OpenAI o1/o3 models support thinking (reasoning)
+	// These models have built-in reasoning capabilities
+	if strings.Contains(lower, "o1") || strings.Contains(lower, "o3") {
+		return true
+	}
+
+	// Codex models support thinking
+	if strings.Contains(lower, "codex") {
+		return true
+	}
+
+	// GPT models with reasoning support (gpt-4o with reasoning, etc.)
+	// Note: Not all GPT models support thinking, but we allow it for flexibility
+	// The actual thinking application is handled by the thinking package
+	if strings.Contains(lower, "gpt") && (strings.Contains(lower, "reason") || strings.Contains(lower, "think")) {
 		return true
 	}
 

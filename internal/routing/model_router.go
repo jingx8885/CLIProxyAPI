@@ -4,12 +4,14 @@
 package routing
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -401,16 +403,29 @@ func (r *ModelRouter) findRouteEntry(modelName string) *config.ModelRouteEntry {
 // ResolveFuzzyCandidate resolves a candidate pattern to an actual available model.
 // If the candidate contains wildcards (*), it searches the model registry.
 // Otherwise, it checks if the model has available providers.
+// Supports thinking suffix in the format: pattern(suffix), e.g., "*gpt-5.2-codex*(xhigh)"
+// The suffix is preserved and appended to the resolved model name.
 func (r *ModelRouter) ResolveFuzzyCandidate(candidate string) string {
 	candidate = strings.TrimSpace(candidate)
 	if candidate == "" {
 		return ""
 	}
 
+	// Extract thinking suffix if present (e.g., "*gpt-5.2-codex*(xhigh)" -> pattern="*gpt-5.2-codex*", suffix="xhigh")
+	parsed := thinking.ParseSuffix(candidate)
+	pattern := parsed.ModelName
+	suffix := ""
+	if parsed.HasSuffix {
+		suffix = parsed.RawSuffix
+	}
+
 	// If no wildcard, check directly if model has providers
-	if !strings.Contains(candidate, "*") {
-		if len(util.GetProviderName(candidate)) > 0 {
-			return candidate
+	if !strings.Contains(pattern, "*") {
+		if len(util.GetProviderName(pattern)) > 0 {
+			if suffix != "" {
+				return fmt.Sprintf("%s(%s)", pattern, suffix)
+			}
+			return pattern
 		}
 		return ""
 	}
@@ -424,9 +439,13 @@ func (r *ModelRouter) ResolveFuzzyCandidate(candidate string) string {
 		if !ok || modelID == "" {
 			continue
 		}
-		if matchWildcard(candidate, modelID) {
+		if matchWildcard(pattern, modelID) {
 			// Verify the matched model has providers
 			if len(util.GetProviderName(modelID)) > 0 {
+				// Append thinking suffix if present
+				if suffix != "" {
+					return fmt.Sprintf("%s(%s)", modelID, suffix)
+				}
 				return modelID
 			}
 		}
