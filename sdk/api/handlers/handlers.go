@@ -25,6 +25,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"golang.org/x/net/context"
 )
 
@@ -155,7 +156,58 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if key == "" {
 		key = uuid.NewString()
 	}
-	return map[string]any{idempotencyKeyMetadataKey: key}
+	return map[string]any{"idempotency_key": key}
+}
+
+// extractUserIDFromPayload extracts the user_id from Claude request metadata.
+// This is used for session binding to maximize cache hits.
+func extractUserIDFromPayload(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	// Try Claude format: metadata.user_id
+	userID := gjson.GetBytes(payload, "metadata.user_id")
+	if userID.Exists() && userID.String() != "" {
+		return strings.TrimSpace(userID.String())
+	}
+	// Try OpenAI format: user
+	user := gjson.GetBytes(payload, "user")
+	if user.Exists() && user.String() != "" {
+		return strings.TrimSpace(user.String())
+	}
+	return ""
+}
+
+// extractSessionIDFromPayload extracts session_id from the request payload.
+func extractSessionIDFromPayload(payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	// Try session_id field
+	sessionID := gjson.GetBytes(payload, "session_id")
+	if sessionID.Exists() && sessionID.String() != "" {
+		return strings.TrimSpace(sessionID.String())
+	}
+	// Try prompt_cache_key for Codex
+	promptCacheKey := gjson.GetBytes(payload, "prompt_cache_key")
+	if promptCacheKey.Exists() && promptCacheKey.String() != "" {
+		return strings.TrimSpace(promptCacheKey.String())
+	}
+	return ""
+}
+
+// buildExecutorOptions creates executor options with session binding information.
+func buildExecutorOptions(stream bool, alt string, rawJSON []byte, sourceFormat sdktranslator.Format, metadata map[string]any) coreexecutor.Options {
+	opts := coreexecutor.Options{
+		Stream:          stream,
+		Alt:             alt,
+		OriginalRequest: cloneBytes(rawJSON),
+		SourceFormat:    sourceFormat,
+		Metadata:        metadata,
+		UserID:          extractUserIDFromPayload(rawJSON),
+		SessionID:       extractSessionIDFromPayload(rawJSON),
+	}
+	return opts
 }
 
 func mergeMetadata(base, overlay map[string]any) map[string]any {
@@ -403,13 +455,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
 	}
-	opts := coreexecutor.Options{
-		Stream:          false,
-		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
-		SourceFormat:    sdktranslator.FromString(handlerType),
-	}
-	opts.Metadata = reqMeta
+	opts := buildExecutorOptions(false, alt, rawJSON, sdktranslator.FromString(handlerType), reqMeta)
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -441,13 +487,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
 	}
-	opts := coreexecutor.Options{
-		Stream:          false,
-		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
-		SourceFormat:    sdktranslator.FromString(handlerType),
-	}
-	opts.Metadata = reqMeta
+	opts := buildExecutorOptions(false, alt, rawJSON, sdktranslator.FromString(handlerType), reqMeta)
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
 	if err != nil {
 		status := http.StatusInternalServerError
@@ -490,13 +530,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		Model:   normalizedModel,
 		Payload: cloneBytes(rawJSON),
 	}
-	opts := coreexecutor.Options{
-		Stream:          true,
-		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
-		SourceFormat:    sdktranslator.FromString(handlerType),
-	}
-	opts.Metadata = reqMeta
+	opts := buildExecutorOptions(true, alt, rawJSON, sdktranslator.FromString(handlerType), reqMeta)
 	chunks, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 	if err != nil {
 		errChan := make(chan *interfaces.ErrorMessage, 1)
@@ -804,13 +838,7 @@ func (h *BaseAPIHandler) executeWithRoutingCandidates(ctx context.Context, handl
 			Model:   normalizedModel,
 			Payload: preparedPayload,
 		}
-		opts := coreexecutor.Options{
-			Stream:          false,
-			Alt:             alt,
-			OriginalRequest: cloneBytes(rawJSON),
-			SourceFormat:    sdktranslator.FromString(handlerType),
-		}
-		opts.Metadata = reqMeta
+		opts := buildExecutorOptions(false, alt, rawJSON, sdktranslator.FromString(handlerType), reqMeta)
 
 		var resp coreexecutor.Response
 		var err error
@@ -925,13 +953,7 @@ func (h *BaseAPIHandler) executeStreamWithRoutingCandidates(ctx context.Context,
 			Model:   normalizedModel,
 			Payload: preparedPayload,
 		}
-		opts := coreexecutor.Options{
-			Stream:          true,
-			Alt:             alt,
-			OriginalRequest: cloneBytes(rawJSON),
-			SourceFormat:    sdktranslator.FromString(handlerType),
-		}
-		opts.Metadata = reqMeta
+		opts := buildExecutorOptions(true, alt, rawJSON, sdktranslator.FromString(handlerType), reqMeta)
 
 		chunks, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 		if err != nil {

@@ -248,8 +248,22 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 
 				// Include thinking tokens in output token count if present
 				thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
+				cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
+				promptTokenCount := usageResult.Get("promptTokenCount").Int()
+
+				// Subtract cached tokens from input tokens to show actual new tokens processed
+				inputTokens := promptTokenCount - cachedTokenCount
+				if inputTokens < 0 {
+					inputTokens = 0
+				}
+
 				template, _ = sjson.Set(template, "usage.output_tokens", candidatesTokenCountResult.Int()+thoughtsTokenCount)
-				template, _ = sjson.Set(template, "usage.input_tokens", usageResult.Get("promptTokenCount").Int())
+				template, _ = sjson.Set(template, "usage.input_tokens", inputTokens)
+
+				// Add cache_read_input_tokens if cached tokens are present (indicates prompt caching is working)
+				if cachedTokenCount > 0 {
+					template, _ = sjson.Set(template, "usage.cache_read_input_tokens", cachedTokenCount)
+				}
 
 				output = output + template + "\n\n\n"
 			}
@@ -279,10 +293,23 @@ func ConvertGeminiCLIResponseToClaudeNonStream(_ context.Context, _ string, orig
 	out, _ = sjson.Set(out, "id", root.Get("response.responseId").String())
 	out, _ = sjson.Set(out, "model", root.Get("response.modelVersion").String())
 
-	inputTokens := root.Get("response.usageMetadata.promptTokenCount").Int()
+	promptTokens := root.Get("response.usageMetadata.promptTokenCount").Int()
+	cachedTokens := root.Get("response.usageMetadata.cachedContentTokenCount").Int()
 	outputTokens := root.Get("response.usageMetadata.candidatesTokenCount").Int() + root.Get("response.usageMetadata.thoughtsTokenCount").Int()
+
+	// Subtract cached tokens from input tokens to show actual new tokens processed
+	inputTokens := promptTokens - cachedTokens
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+
 	out, _ = sjson.Set(out, "usage.input_tokens", inputTokens)
 	out, _ = sjson.Set(out, "usage.output_tokens", outputTokens)
+
+	// Add cache_read_input_tokens if cached tokens are present (indicates prompt caching is working)
+	if cachedTokens > 0 {
+		out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cachedTokens)
+	}
 
 	parts := root.Get("response.candidates.0.content.parts")
 	textBuilder := strings.Builder{}

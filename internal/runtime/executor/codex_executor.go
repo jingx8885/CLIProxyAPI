@@ -507,34 +507,54 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 }
 
 func (e *CodexExecutor) cacheHelper(ctx context.Context, from sdktranslator.Format, url string, req cliproxyexecutor.Request, rawJSON []byte) (*http.Request, error) {
-	var cache codexCache
+	var cacheID string
+
 	if from == "claude" {
+		// For Claude requests, generate a stable cache key based on user_id
+		// This ensures the same user_id always gets the same cache key, maximizing cache hits
 		userIDResult := gjson.GetBytes(req.Payload, "metadata.user_id")
-		if userIDResult.Exists() {
-			key := fmt.Sprintf("%s-%s", req.Model, userIDResult.String())
-			var ok bool
-			if cache, ok = getCodexCache(key); !ok {
-				cache = codexCache{
-					ID:     uuid.New().String(),
+		if userIDResult.Exists() && userIDResult.String() != "" {
+			userID := userIDResult.String()
+			// Use model + user_id as the cache key to ensure stability
+			cacheKey := fmt.Sprintf("%s-%s", req.Model, userID)
+			if cache, ok := getCodexCache(cacheKey); ok {
+				cacheID = cache.ID
+			} else {
+				// Generate a deterministic UUID based on user_id for stability
+				// This ensures the same user_id always gets the same prompt_cache_key
+				cacheID = generateDeterministicUUID(userID)
+				setCodexCache(cacheKey, codexCache{
+					ID:     cacheID,
 					Expire: time.Now().Add(1 * time.Hour),
-				}
-				setCodexCache(key, cache)
+				})
 			}
 		}
 	} else if from == "openai-response" {
+		// For OpenAI Responses API requests, use the provided prompt_cache_key directly
 		promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key")
-		if promptCacheKey.Exists() {
-			cache.ID = promptCacheKey.String()
+		if promptCacheKey.Exists() && promptCacheKey.String() != "" {
+			cacheID = promptCacheKey.String()
 		}
 	}
 
-	rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cache.ID)
+	// If no cache ID was determined, generate a random one as fallback
+	if cacheID == "" {
+		cacheID = uuid.New().String()
+	}
+
+	// Set prompt_cache_key in the request body
+	rawJSON, _ = sjson.SetBytes(rawJSON, "prompt_cache_key", cacheID)
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(rawJSON))
 	if err != nil {
 		return nil, err
 	}
-	httpReq.Header.Set("Conversation_id", cache.ID)
-	httpReq.Header.Set("Session_id", cache.ID)
+
+	// Set conversation_id and session_id headers for cache binding
+	// These headers are used by ChatGPT internal API to maintain session state
+	httpReq.Header.Set("Conversation_id", cacheID)
+	httpReq.Header.Set("Session_id", cacheID)
+
 	return httpReq, nil
 }
 

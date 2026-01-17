@@ -128,8 +128,23 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		} else {
 			template, _ = sjson.Set(template, "delta.stop_reason", "end_turn")
 		}
-		template, _ = sjson.Set(template, "usage.input_tokens", rootResult.Get("response.usage.input_tokens").Int())
-		template, _ = sjson.Set(template, "usage.output_tokens", rootResult.Get("response.usage.output_tokens").Int())
+
+		// Extract usage information including cache stats
+		inputTokens := rootResult.Get("response.usage.input_tokens").Int()
+		outputTokens := rootResult.Get("response.usage.output_tokens").Int()
+		cacheReadTokens := rootResult.Get("response.usage.cache_read_input_tokens").Int()
+		cacheCreationTokens := rootResult.Get("response.usage.cache_creation_input_tokens").Int()
+
+		template, _ = sjson.Set(template, "usage.input_tokens", inputTokens)
+		template, _ = sjson.Set(template, "usage.output_tokens", outputTokens)
+
+		// Add cache statistics if present (indicates prompt caching is working)
+		if cacheReadTokens > 0 {
+			template, _ = sjson.Set(template, "usage.cache_read_input_tokens", cacheReadTokens)
+		}
+		if cacheCreationTokens > 0 {
+			template, _ = sjson.Set(template, "usage.cache_creation_input_tokens", cacheCreationTokens)
+		}
 
 		output = "event: message_delta\n"
 		output += fmt.Sprintf("data: %s\n\n", template)
@@ -323,6 +338,14 @@ func ConvertCodexResponseToClaudeNonStream(_ context.Context, _ string, original
 	if responseData.Get("usage.input_tokens").Exists() || responseData.Get("usage.output_tokens").Exists() {
 		out, _ = sjson.Set(out, "usage.input_tokens", responseData.Get("usage.input_tokens").Int())
 		out, _ = sjson.Set(out, "usage.output_tokens", responseData.Get("usage.output_tokens").Int())
+
+		// Add cache statistics if present (indicates prompt caching is working)
+		if cacheReadTokens := responseData.Get("usage.cache_read_input_tokens").Int(); cacheReadTokens > 0 {
+			out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cacheReadTokens)
+		}
+		if cacheCreationTokens := responseData.Get("usage.cache_creation_input_tokens").Int(); cacheCreationTokens > 0 {
+			out, _ = sjson.Set(out, "usage.cache_creation_input_tokens", cacheCreationTokens)
+		}
 	}
 
 	return out

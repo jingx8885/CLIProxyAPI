@@ -24,7 +24,8 @@ type Params struct {
 	HasFirstResponse bool
 	ResponseType     int
 	ResponseIndex    int
-	HasContent       bool // Tracks whether any content (text, thinking, or tool use) has been output
+	HasContent       bool  // Tracks whether any content (text, thinking, or tool use) has been output
+	CachedTokenCount int64 // Cached content token count (indicates prompt caching)
 }
 
 // toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
@@ -254,8 +255,22 @@ func ConvertGeminiResponseToClaude(_ context.Context, _ string, originalRequestR
 				}
 
 				thoughtsTokenCount := usageResult.Get("thoughtsTokenCount").Int()
+				cachedTokenCount := usageResult.Get("cachedContentTokenCount").Int()
+				promptTokenCount := usageResult.Get("promptTokenCount").Int()
+
+				// Subtract cached tokens from input tokens to show actual new tokens processed
+				inputTokens := promptTokenCount - cachedTokenCount
+				if inputTokens < 0 {
+					inputTokens = 0
+				}
+
 				template, _ = sjson.Set(template, "usage.output_tokens", candidatesTokenCountResult.Int()+thoughtsTokenCount)
-				template, _ = sjson.Set(template, "usage.input_tokens", usageResult.Get("promptTokenCount").Int())
+				template, _ = sjson.Set(template, "usage.input_tokens", inputTokens)
+
+				// Add cache_read_input_tokens if cached tokens are present (indicates prompt caching is working)
+				if cachedTokenCount > 0 {
+					template, _ = sjson.Set(template, "usage.cache_read_input_tokens", cachedTokenCount)
+				}
 
 				output = output + template + "\n\n\n"
 			}
@@ -285,10 +300,23 @@ func ConvertGeminiResponseToClaudeNonStream(_ context.Context, _ string, origina
 	out, _ = sjson.Set(out, "id", root.Get("responseId").String())
 	out, _ = sjson.Set(out, "model", root.Get("modelVersion").String())
 
-	inputTokens := root.Get("usageMetadata.promptTokenCount").Int()
+	promptTokens := root.Get("usageMetadata.promptTokenCount").Int()
+	cachedTokens := root.Get("usageMetadata.cachedContentTokenCount").Int()
 	outputTokens := root.Get("usageMetadata.candidatesTokenCount").Int() + root.Get("usageMetadata.thoughtsTokenCount").Int()
+
+	// Subtract cached tokens from input tokens to show actual new tokens processed
+	inputTokens := promptTokens - cachedTokens
+	if inputTokens < 0 {
+		inputTokens = 0
+	}
+
 	out, _ = sjson.Set(out, "usage.input_tokens", inputTokens)
 	out, _ = sjson.Set(out, "usage.output_tokens", outputTokens)
+
+	// Add cache_read_input_tokens if cached tokens are present (indicates prompt caching is working)
+	if cachedTokens > 0 {
+		out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cachedTokens)
+	}
 
 	parts := root.Get("candidates.0.content.parts")
 	textBuilder := strings.Builder{}

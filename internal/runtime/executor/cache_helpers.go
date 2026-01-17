@@ -1,8 +1,11 @@
 package executor
 
 import (
+	"crypto/sha256"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type codexCache struct {
@@ -65,4 +68,14 @@ func setCodexCache(key string, cache codexCache) {
 	codexCacheMu.Lock()
 	codexCacheMap[key] = cache
 	codexCacheMu.Unlock()
+}
+
+// generateDeterministicUUID generates a deterministic UUID v5 based on the input string.
+// This ensures the same input always produces the same UUID, which is essential for
+// cache key stability across requests from the same user/session.
+func generateDeterministicUUID(input string) string {
+	// Use SHA-256 to hash the input, then use the first 16 bytes to create a UUID
+	hash := sha256.Sum256([]byte(input))
+	// Create a UUID v5-like format using the hash bytes
+	return uuid.NewSHA1(uuid.NameSpaceDNS, hash[:]).String()
 }

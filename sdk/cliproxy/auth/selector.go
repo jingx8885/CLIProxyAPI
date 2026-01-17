@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -284,4 +286,181 @@ func getEffectiveResetTimeFromState(q *QuotaState, fallback time.Time) time.Time
 		return q.NextRecoverAt
 	}
 	return fallback
+}
+
+// SessionBindingSelector implements sticky session binding for cache optimization.
+// It binds the same user_id to the same account to maximize cache hits.
+// Falls back to round-robin when no session binding exists or the bound account is unavailable.
+type SessionBindingSelector struct {
+	mu       sync.RWMutex
+	bindings map[string]*sessionBinding // sessionKey -> binding
+	cursors  map[string]int             // for round-robin fallback
+	ttl      time.Duration              // binding TTL
+}
+
+type sessionBinding struct {
+	AuthID    string
+	CreatedAt time.Time
+	LastUsed  time.Time
+}
+
+// SessionBindingTTL is the default TTL for session bindings (1 hour).
+const SessionBindingTTL = time.Hour
+
+// NewSessionBindingSelector creates a new session binding selector with the given TTL.
+// If ttl is 0, SessionBindingTTL is used.
+func NewSessionBindingSelector(ttl time.Duration) *SessionBindingSelector {
+	if ttl <= 0 {
+		ttl = SessionBindingTTL
+	}
+	s := &SessionBindingSelector{
+		bindings: make(map[string]*sessionBinding),
+		cursors:  make(map[string]int),
+		ttl:      ttl,
+	}
+	// Start background cleanup
+	go s.cleanupLoop()
+	return s
+}
+
+// Pick selects an auth for the request, using session binding when available.
+func (s *SessionBindingSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	now := time.Now()
+	available, err := getAvailableAuths(auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+
+	// Extract session key from options (user_id from Claude request metadata)
+	sessionKey := s.extractSessionKey(opts)
+	if sessionKey == "" {
+		// No session key, fall back to round-robin
+		return s.roundRobinPick(provider, model, available)
+	}
+
+	// Try to find existing binding
+	s.mu.RLock()
+	binding := s.bindings[sessionKey]
+	s.mu.RUnlock()
+
+	if binding != nil && now.Sub(binding.LastUsed) < s.ttl {
+		// Check if bound auth is still available
+		for _, auth := range available {
+			if auth.ID == binding.AuthID {
+				// Update last used time
+				s.mu.Lock()
+				binding.LastUsed = now
+				s.mu.Unlock()
+				return auth, nil
+			}
+		}
+		// Bound auth is no longer available, clear binding
+		s.mu.Lock()
+		delete(s.bindings, sessionKey)
+		s.mu.Unlock()
+	}
+
+	// No valid binding, select via round-robin and create new binding
+	selected, err := s.roundRobinPick(provider, model, available)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create new binding
+	s.mu.Lock()
+	s.bindings[sessionKey] = &sessionBinding{
+		AuthID:    selected.ID,
+		CreatedAt: now,
+		LastUsed:  now,
+	}
+	s.mu.Unlock()
+
+	return selected, nil
+}
+
+// extractSessionKey extracts a session key from the request options.
+// It uses user_id from Claude request metadata to create a stable session key.
+func (s *SessionBindingSelector) extractSessionKey(opts cliproxyexecutor.Options) string {
+	if opts.SessionID != "" {
+		return hashSessionKey(opts.SessionID)
+	}
+	if opts.UserID != "" {
+		return hashSessionKey(opts.UserID)
+	}
+	return ""
+}
+
+// hashSessionKey creates a hash of the session key for privacy and consistent length.
+func hashSessionKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	hash := sha256.Sum256([]byte(key))
+	return hex.EncodeToString(hash[:16]) // Use first 16 bytes for shorter key
+}
+
+// roundRobinPick performs round-robin selection among available auths.
+func (s *SessionBindingSelector) roundRobinPick(provider, model string, available []*Auth) (*Auth, error) {
+	if len(available) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+
+	key := provider + ":" + model
+	s.mu.Lock()
+	if s.cursors == nil {
+		s.cursors = make(map[string]int)
+	}
+	index := s.cursors[key]
+	if index >= 2_147_483_640 {
+		index = 0
+	}
+	s.cursors[key] = index + 1
+	s.mu.Unlock()
+
+	return available[index%len(available)], nil
+}
+
+// cleanupLoop periodically removes expired bindings.
+func (s *SessionBindingSelector) cleanupLoop() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		s.cleanup()
+	}
+}
+
+// cleanup removes expired bindings.
+func (s *SessionBindingSelector) cleanup() {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for key, binding := range s.bindings {
+		if now.Sub(binding.LastUsed) > s.ttl {
+			delete(s.bindings, key)
+		}
+	}
+}
+
+// GetBinding returns the current binding for a session key (for debugging/monitoring).
+func (s *SessionBindingSelector) GetBinding(sessionKey string) (authID string, exists bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if binding, ok := s.bindings[sessionKey]; ok {
+		return binding.AuthID, true
+	}
+	return "", false
+}
+
+// ClearBinding removes a specific session binding.
+func (s *SessionBindingSelector) ClearBinding(sessionKey string) {
+	s.mu.Lock()
+	delete(s.bindings, sessionKey)
+	s.mu.Unlock()
+}
+
+// ClearAllBindings removes all session bindings.
+func (s *SessionBindingSelector) ClearAllBindings() {
+	s.mu.Lock()
+	s.bindings = make(map[string]*sessionBinding)
+	s.mu.Unlock()
 }

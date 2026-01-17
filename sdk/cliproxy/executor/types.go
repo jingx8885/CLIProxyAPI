@@ -35,6 +35,11 @@ type Options struct {
 	SourceFormat sdktranslator.Format
 	// Metadata carries extra execution hints shared across selection and executors.
 	Metadata map[string]any
+	// SessionID is used for session binding to maximize cache hits.
+	// When set, the same session will be routed to the same account.
+	SessionID string
+	// UserID is extracted from Claude request metadata.user_id for session binding.
+	UserID string
 }
 
 // Response wraps either a full provider response or metadata for streaming flows.
