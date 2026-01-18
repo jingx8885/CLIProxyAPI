@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	log "github.com/sirupsen/logrus"
 
 	"github.com/tidwall/gjson"
@@ -39,6 +40,7 @@ type Params struct {
 	HasSentFinalEvents   bool   // Indicates if final content/message events have been sent
 	HasToolUse           bool   // Indicates if tool use was observed in the stream
 	HasContent           bool   // Tracks whether any content (text, thinking, or tool use) has been output
+	PendingMessageStart  string // Stores the message_start event to be sent when content is detected
 
 	// Signature caching support
 	SessionID           string          // Session ID derived from request for signature caching
@@ -81,20 +83,33 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 		// Only send final events if we have actually output content
 		if params.HasContent {
 			appendFinalEvents(params, &output, true)
-			return []string{
+			results := []string{
 				output + "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n\n",
 			}
+			logging.LogTranslatorOutput("antigravity->claude", "", results)
+			return results
 		}
+		// Log when we receive [DONE] but have no content
+		logging.LogTranslatorWarning("antigravity->claude", "", "received [DONE] but HasContent=false")
 		return []string{}
 	}
 
+	// Log input for debugging (only for actual content, not [DONE])
+	logging.LogTranslatorInput("antigravity->claude", "", rawJSON)
+
 	output := ""
+
+	// Helper function to prepend message_start if this is the first content
+	prependMessageStartIfNeeded := func() {
+		if params.PendingMessageStart != "" {
+			output = params.PendingMessageStart + output
+			params.PendingMessageStart = ""
+		}
+	}
 
 	// Initialize the streaming session with a message_start event
 	// This is only sent for the very first response chunk to establish the streaming session
 	if !params.HasFirstResponse {
-		output = "event: message_start\n"
-
 		// Create the initial message structure with default values according to Claude Code API specification
 		// This follows the Claude Code API specification for streaming message initialization
 		messageStartTemplate := `{"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-3-5-sonnet-20241022", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}`
@@ -114,7 +129,8 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 		if responseIDResult := gjson.GetBytes(rawJSON, "response.responseId"); responseIDResult.Exists() {
 			messageStartTemplate, _ = sjson.Set(messageStartTemplate, "message.id", responseIDResult.String())
 		}
-		output = output + fmt.Sprintf("data: %s\n\n\n", messageStartTemplate)
+		// Store the message_start event to be sent when content is detected
+		params.PendingMessageStart = "event: message_start\n" + fmt.Sprintf("data: %s\n\n\n", messageStartTemplate)
 
 		params.HasFirstResponse = true
 	}
@@ -144,16 +160,22 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 							params.CurrentThinkingText.Reset()
 						}
 
+						if !params.HasContent {
+							params.HasContent = true
+							prependMessageStartIfNeeded()
+						}
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"signature_delta","signature":""}}`, params.ResponseIndex), "delta.signature", thoughtSignature.String())
 						output = output + fmt.Sprintf("data: %s\n\n\n", data)
-						params.HasContent = true
 					} else if params.ResponseType == 2 { // Continue existing thinking block if already in thinking state
 						params.CurrentThinkingText.WriteString(partTextResult.String())
+						if !params.HasContent {
+							params.HasContent = true
+							prependMessageStartIfNeeded()
+						}
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex), "delta.thinking", partTextResult.String())
 						output = output + fmt.Sprintf("data: %s\n\n\n", data)
-						params.HasContent = true
 					} else {
 						// Transition from another state to thinking
 						// First, close any existing content block
@@ -173,11 +195,14 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 						output = output + "event: content_block_start\n"
 						output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"thinking","thinking":""}}`, params.ResponseIndex)
 						output = output + "\n\n\n"
+						if !params.HasContent {
+							params.HasContent = true
+							prependMessageStartIfNeeded()
+						}
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, params.ResponseIndex), "delta.thinking", partTextResult.String())
 						output = output + fmt.Sprintf("data: %s\n\n\n", data)
 						params.ResponseType = 2 // Set state to thinking
-						params.HasContent = true
 						// Start accumulating thinking text for signature caching
 						params.CurrentThinkingText.Reset()
 						params.CurrentThinkingText.WriteString(partTextResult.String())
@@ -188,10 +213,13 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 						// Process regular text content (user-visible output)
 						// Continue existing text block if already in content state
 						if params.ResponseType == 1 {
+							if !params.HasContent {
+								params.HasContent = true
+								prependMessageStartIfNeeded()
+							}
 							output = output + "event: content_block_delta\n"
 							data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", partTextResult.String())
 							output = output + fmt.Sprintf("data: %s\n\n\n", data)
-							params.HasContent = true
 						} else {
 							// Transition from another state to text content
 							// First, close any existing content block
@@ -207,6 +235,10 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 								params.ResponseIndex++
 							}
 							if partTextResult.String() != "" {
+								if !params.HasContent {
+									params.HasContent = true
+									prependMessageStartIfNeeded()
+								}
 								// Start a new text content block
 								output = output + "event: content_block_start\n"
 								output = output + fmt.Sprintf(`data: {"type":"content_block_start","index":%d,"content_block":{"type":"text","text":""}}`, params.ResponseIndex)
@@ -215,7 +247,6 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 								data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, params.ResponseIndex), "delta.text", partTextResult.String())
 								output = output + fmt.Sprintf("data: %s\n\n\n", data)
 								params.ResponseType = 1 // Set state to content
-								params.HasContent = true
 							}
 						}
 					}
@@ -261,13 +292,16 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 				data, _ = sjson.Set(data, "content_block.name", fcName)
 				output = output + fmt.Sprintf("data: %s\n\n\n", data)
 
+				if !params.HasContent {
+					params.HasContent = true
+					prependMessageStartIfNeeded()
+				}
 				if fcArgsResult := functionCallResult.Get("args"); fcArgsResult.Exists() {
 					output = output + "event: content_block_delta\n"
 					data, _ = sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"input_json_delta","partial_json":""}}`, params.ResponseIndex), "delta.partial_json", fcArgsResult.Raw)
 					output = output + fmt.Sprintf("data: %s\n\n\n", data)
 				}
 				params.ResponseType = 3
-				params.HasContent = true
 			}
 		}
 	}
@@ -275,6 +309,50 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 	if finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason"); finishReasonResult.Exists() {
 		params.HasFinishReason = true
 		params.FinishReason = finishReasonResult.String()
+
+		// Handle error finish reasons that may have no content
+		// Generate an error message to prevent "No assistant messages found" error
+		if !params.HasContent {
+			switch params.FinishReason {
+			case "MALFORMED_FUNCTION_CALL":
+				// Get the finish message if available
+				finishMsg := gjson.GetBytes(rawJSON, "response.candidates.0.finishMessage").String()
+				errorText := "Error: Malformed function call from upstream API"
+				if finishMsg != "" {
+					errorText = fmt.Sprintf("Error: %s", finishMsg)
+				}
+				// Generate a text response with the error
+				params.HasContent = true
+				prependMessageStartIfNeeded()
+				output += "event: content_block_start\n"
+				output += fmt.Sprintf("data: {\"type\":\"content_block_start\",\"index\":%d,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\n", params.ResponseIndex)
+				output += "event: content_block_delta\n"
+				data, _ := sjson.Set(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`, "index", params.ResponseIndex)
+				data, _ = sjson.Set(data, "delta.text", errorText)
+				output += fmt.Sprintf("data: %s\n\n\n", data)
+				output += "event: content_block_stop\n"
+				output += fmt.Sprintf("data: {\"type\":\"content_block_stop\",\"index\":%d}\n\n\n", params.ResponseIndex)
+				params.ResponseIndex++
+				params.ResponseType = 1
+				log.Warnf("antigravity->claude translator: received MALFORMED_FUNCTION_CALL, generated error message")
+			case "SAFETY", "RECITATION", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII":
+				// Handle other error finish reasons similarly
+				errorText := fmt.Sprintf("Error: Request blocked due to %s", params.FinishReason)
+				params.HasContent = true
+				prependMessageStartIfNeeded()
+				output += "event: content_block_start\n"
+				output += fmt.Sprintf("data: {\"type\":\"content_block_start\",\"index\":%d,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\n", params.ResponseIndex)
+				output += "event: content_block_delta\n"
+				data, _ := sjson.Set(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`, "index", params.ResponseIndex)
+				data, _ = sjson.Set(data, "delta.text", errorText)
+				output += fmt.Sprintf("data: %s\n\n\n", data)
+				output += "event: content_block_stop\n"
+				output += fmt.Sprintf("data: {\"type\":\"content_block_stop\",\"index\":%d}\n\n\n", params.ResponseIndex)
+				params.ResponseIndex++
+				params.ResponseType = 1
+				log.Warnf("antigravity->claude translator: received error finishReason=%s, generated error message", params.FinishReason)
+			}
+		}
 	}
 
 	if usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata"); usageResult.Exists() {
@@ -296,7 +374,12 @@ func ConvertAntigravityResponseToClaude(_ context.Context, _ string, originalReq
 		appendFinalEvents(params, &output, false)
 	}
 
-	return []string{output}
+	results := []string{output}
+	// Only log output if there's actual content
+	if output != "" {
+		logging.LogTranslatorOutput("antigravity->claude", "", results)
+	}
+	return results
 }
 
 func appendFinalEvents(params *Params, output *string, force bool) {

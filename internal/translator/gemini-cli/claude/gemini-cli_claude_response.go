@@ -14,6 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -22,10 +25,11 @@ import (
 // This structure tracks the current state of the response translation process to ensure
 // proper sequencing of SSE events and transitions between different content types.
 type Params struct {
-	HasFirstResponse bool // Indicates if the initial message_start event has been sent
-	ResponseType     int  // Current response type: 0=none, 1=content, 2=thinking, 3=function
-	ResponseIndex    int  // Index counter for content blocks in the streaming response
-	HasContent       bool // Tracks whether any content (text, thinking, or tool use) has been output
+	HasFirstResponse    bool   // Indicates if the initial message_start event has been sent
+	ResponseType        int    // Current response type: 0=none, 1=content, 2=thinking, 3=function
+	ResponseIndex       int    // Index counter for content blocks in the streaming response
+	HasContent          bool   // Tracks whether any content (text, thinking, or tool use) has been output
+	PendingMessageStart string // Stores the message_start event to be sent when content is detected
 }
 
 // toolUseIDCounter provides a process-wide unique counter for tool use identifiers.
@@ -59,22 +63,29 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 	if bytes.Equal(rawJSON, []byte("[DONE]")) {
 		// Only send message_stop if we have actually output content
 		if (*param).(*Params).HasContent {
-			return []string{
+			results := []string{
 				"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n\n",
 			}
+			logging.LogTranslatorOutput("gemini-cli->claude", "", results)
+			return results
 		}
+		// Log when we receive [DONE] but have no content - this causes "No assistant messages found" error
+		log.Warnf("gemini-cli->claude translator: received [DONE] but HasContent=false, originalRequest=%s", string(originalRequestRawJSON))
+		logging.LogTranslatorWarning("gemini-cli->claude", "", fmt.Sprintf("received [DONE] but HasContent=false"))
 		return []string{}
 	}
+
+	// Log input for debugging (only for actual content, not [DONE])
+	logging.LogTranslatorInput("gemini-cli->claude", "", rawJSON)
 
 	// Track whether tools are being used in this response chunk
 	usedTool := false
 	output := ""
 
-	// Initialize the streaming session with a message_start event
-	// This is only sent for the very first response chunk to establish the streaming session
+	// Prepare the message_start event but don't send it yet
+	// This will be sent only when actual content is detected to prevent
+	// "No assistant messages found" error when Gemini CLI returns empty responses
 	if !(*param).(*Params).HasFirstResponse {
-		output = "event: message_start\n"
-
 		// Create the initial message structure with default values according to Claude Code API specification
 		// This follows the Claude Code API specification for streaming message initialization
 		messageStartTemplate := `{"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-3-5-sonnet-20241022", "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0}}}`
@@ -86,14 +97,28 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 		if responseIDResult := gjson.GetBytes(rawJSON, "response.responseId"); responseIDResult.Exists() {
 			messageStartTemplate, _ = sjson.Set(messageStartTemplate, "message.id", responseIDResult.String())
 		}
-		output = output + fmt.Sprintf("data: %s\n\n\n", messageStartTemplate)
+		// Store the pending message_start event instead of sending it immediately
+		(*param).(*Params).PendingMessageStart = "event: message_start\n" + fmt.Sprintf("data: %s\n\n\n", messageStartTemplate)
 
 		(*param).(*Params).HasFirstResponse = true
+	}
+
+	// Helper function to prepend message_start if this is the first content
+	prependMessageStartIfNeeded := func() {
+		if (*param).(*Params).PendingMessageStart != "" {
+			output = (*param).(*Params).PendingMessageStart + output
+			(*param).(*Params).PendingMessageStart = ""
+		}
 	}
 
 	// Process the response parts array from the backend client
 	// Each part can contain text content, thinking content, or function calls
 	partsResult := gjson.GetBytes(rawJSON, "response.candidates.0.content.parts")
+
+	// Log each response chunk for debugging empty response issues
+	log.Debugf("gemini-cli->claude translator: processing chunk, rawJSON=%s, partsExists=%v, partsIsArray=%v",
+		string(rawJSON), partsResult.Exists(), partsResult.IsArray())
+
 	if partsResult.IsArray() {
 		partResults := partsResult.Array()
 		for i := 0; i < len(partResults); i++ {
@@ -112,7 +137,10 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, (*param).(*Params).ResponseIndex), "delta.thinking", partTextResult.String())
 						output = output + fmt.Sprintf("data: %s\n\n\n", data)
-						(*param).(*Params).HasContent = true
+						if !(*param).(*Params).HasContent {
+							(*param).(*Params).HasContent = true
+							prependMessageStartIfNeeded()
+						}
 					} else {
 						// Transition from another state to thinking
 						// First, close any existing content block
@@ -136,7 +164,10 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"thinking_delta","thinking":""}}`, (*param).(*Params).ResponseIndex), "delta.thinking", partTextResult.String())
 						output = output + fmt.Sprintf("data: %s\n\n\n", data)
 						(*param).(*Params).ResponseType = 2 // Set state to thinking
-						(*param).(*Params).HasContent = true
+						if !(*param).(*Params).HasContent {
+							(*param).(*Params).HasContent = true
+							prependMessageStartIfNeeded()
+						}
 					}
 				} else {
 					// Process regular text content (user-visible output)
@@ -145,7 +176,10 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 						output = output + "event: content_block_delta\n"
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, (*param).(*Params).ResponseIndex), "delta.text", partTextResult.String())
 						output = output + fmt.Sprintf("data: %s\n\n\n", data)
-						(*param).(*Params).HasContent = true
+						if !(*param).(*Params).HasContent {
+							(*param).(*Params).HasContent = true
+							prependMessageStartIfNeeded()
+						}
 					} else {
 						// Transition from another state to text content
 						// First, close any existing content block
@@ -169,7 +203,10 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 						data, _ := sjson.Set(fmt.Sprintf(`{"type":"content_block_delta","index":%d,"delta":{"type":"text_delta","text":""}}`, (*param).(*Params).ResponseIndex), "delta.text", partTextResult.String())
 						output = output + fmt.Sprintf("data: %s\n\n\n", data)
 						(*param).(*Params).ResponseType = 1 // Set state to content
-						(*param).(*Params).HasContent = true
+						if !(*param).(*Params).HasContent {
+							(*param).(*Params).HasContent = true
+							prependMessageStartIfNeeded()
+						}
 					}
 				}
 			} else if functionCallResult.Exists() {
@@ -177,6 +214,7 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 				// This processes tool usage requests and formats them for Claude Code API compatibility
 				usedTool = true
 				fcName := functionCallResult.Get("name").String()
+				log.Debugf("gemini-cli->claude translator: processing functionCall, name=%s, args=%s", fcName, functionCallResult.Get("args").Raw)
 
 				// Handle state transitions when switching to function calls
 				// Close any existing function call block first
@@ -219,14 +257,52 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 					output = output + fmt.Sprintf("data: %s\n\n\n", data)
 				}
 				(*param).(*Params).ResponseType = 3
-				(*param).(*Params).HasContent = true
+				if !(*param).(*Params).HasContent {
+					(*param).(*Params).HasContent = true
+					prependMessageStartIfNeeded()
+				}
 			}
 		}
 	}
 
 	usageResult := gjson.GetBytes(rawJSON, "response.usageMetadata")
+	finishReasonResult := gjson.GetBytes(rawJSON, "response.candidates.0.finishReason")
 	// Process usage metadata and finish reason when present in the response
-	if usageResult.Exists() && bytes.Contains(rawJSON, []byte(`"finishReason"`)) {
+	if usageResult.Exists() && finishReasonResult.Exists() {
+		// Handle error finish reasons that may have no content
+		// Generate an error message to prevent "No assistant messages found" error
+		if !(*param).(*Params).HasContent {
+			finishReason := finishReasonResult.String()
+			switch finishReason {
+			case "MALFORMED_FUNCTION_CALL":
+				finishMsg := gjson.GetBytes(rawJSON, "response.candidates.0.finishMessage").String()
+				errorText := "Error: Malformed function call from upstream API"
+				if finishMsg != "" {
+					errorText = fmt.Sprintf("Error: %s", finishMsg)
+				}
+				(*param).(*Params).HasContent = true
+				prependMessageStartIfNeeded()
+				output += "event: content_block_start\n"
+				output += fmt.Sprintf("data: {\"type\":\"content_block_start\",\"index\":%d,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\n", (*param).(*Params).ResponseIndex)
+				output += "event: content_block_delta\n"
+				data, _ := sjson.Set(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`, "index", (*param).(*Params).ResponseIndex)
+				data, _ = sjson.Set(data, "delta.text", errorText)
+				output += fmt.Sprintf("data: %s\n\n\n", data)
+				log.Warnf("gemini-cli->claude translator: received MALFORMED_FUNCTION_CALL, generated error message")
+			case "SAFETY", "RECITATION", "OTHER", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII":
+				errorText := fmt.Sprintf("Error: Request blocked due to %s", finishReason)
+				(*param).(*Params).HasContent = true
+				prependMessageStartIfNeeded()
+				output += "event: content_block_start\n"
+				output += fmt.Sprintf("data: {\"type\":\"content_block_start\",\"index\":%d,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\n", (*param).(*Params).ResponseIndex)
+				output += "event: content_block_delta\n"
+				data, _ := sjson.Set(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`, "index", (*param).(*Params).ResponseIndex)
+				data, _ = sjson.Set(data, "delta.text", errorText)
+				output += fmt.Sprintf("data: %s\n\n\n", data)
+				log.Warnf("gemini-cli->claude translator: received error finishReason=%s, generated error message", finishReason)
+			}
+		}
+
 		if candidatesTokenCountResult := usageResult.Get("candidatesTokenCount"); candidatesTokenCountResult.Exists() {
 			// Only send final events if we have actually output content
 			if (*param).(*Params).HasContent {
@@ -270,7 +346,12 @@ func ConvertGeminiCLIResponseToClaude(_ context.Context, _ string, originalReque
 		}
 	}
 
-	return []string{output}
+	results := []string{output}
+	// Only log output if there's actual content
+	if output != "" {
+		logging.LogTranslatorOutput("gemini-cli->claude", "", results)
+	}
+	return results
 }
 
 // ConvertGeminiCLIResponseToClaudeNonStream converts a non-streaming Gemini CLI response to a non-streaming Claude response.

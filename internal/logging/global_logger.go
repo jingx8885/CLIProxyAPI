@@ -163,6 +163,16 @@ func ConfigureLogOutput(cfg *config.Config) error {
 	}
 
 	configureLogDirCleanerLocked(logDir, cfg.LogsMaxTotalSizeMB, protectedPath)
+
+	// Configure translator debug log
+	if cfg.TranslatorDebugLog {
+		if err := EnableTranslatorDebugLog(); err != nil {
+			log.Errorf("failed to enable translator debug log: %v", err)
+		}
+	} else {
+		DisableTranslatorDebugLog()
+	}
+
 	return nil
 }
 

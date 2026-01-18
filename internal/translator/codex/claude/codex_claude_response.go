@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -22,9 +24,10 @@ var (
 
 // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
 type ConvertCodexResponseToClaudeParams struct {
-	HasToolCall bool
-	BlockIndex  int
-	HasContent  bool // Tracks whether any content (text, thinking, or tool use) has been output
+	HasToolCall         bool
+	BlockIndex          int
+	HasContent          bool   // Tracks whether any content (text, thinking, or tool use) has been output
+	PendingMessageStart string // Stores the message_start event to be sent when content is detected
 }
 
 // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
@@ -58,25 +61,45 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	}
 	rawJSON = bytes.TrimSpace(rawJSON[5:])
 
+	// Log input for debugging (only after confirming it has data: prefix)
+	logging.LogTranslatorInput("codex->claude", "", rawJSON)
+
 	output := ""
 	rootResult := gjson.ParseBytes(rawJSON)
 	typeResult := rootResult.Get("type")
 	typeStr := typeResult.String()
 	template := ""
+	
+	// Log each response chunk for debugging empty response issues
+	log.Debugf("codex->claude translator: processing chunk, type=%s, rawJSON=%s", typeStr, string(rawJSON))
+	
+	// Helper function to prepend message_start if this is the first content
+	prependMessageStartIfNeeded := func() {
+		if (*param).(*ConvertCodexResponseToClaudeParams).PendingMessageStart != "" {
+			output = (*param).(*ConvertCodexResponseToClaudeParams).PendingMessageStart + output
+			(*param).(*ConvertCodexResponseToClaudeParams).PendingMessageStart = ""
+		}
+	}
+	
 	if typeStr == "response.created" {
+		// Store the message_start event but don't send it yet
+		// This will be sent only when actual content is detected
 		template = `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"claude-opus-4-1-20250805","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`
 		template, _ = sjson.Set(template, "message.model", rootResult.Get("response.model").String())
 		template, _ = sjson.Set(template, "message.id", rootResult.Get("response.id").String())
 
-		output = "event: message_start\n"
-		output += fmt.Sprintf("data: %s\n\n", template)
+		// Store pending message_start instead of sending immediately
+		(*param).(*ConvertCodexResponseToClaudeParams).PendingMessageStart = "event: message_start\n" + fmt.Sprintf("data: %s\n\n", template)
 	} else if typeStr == "response.reasoning_summary_part.added" {
 		template = `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
 		template, _ = sjson.Set(template, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
-		(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
+		if !(*param).(*ConvertCodexResponseToClaudeParams).HasContent {
+			(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
+		}
 
 		output = "event: content_block_start\n"
 		output += fmt.Sprintf("data: %s\n\n", template)
+		prependMessageStartIfNeeded()
 	} else if typeStr == "response.reasoning_summary_text.delta" {
 		template = `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
 		template, _ = sjson.Set(template, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
@@ -95,10 +118,13 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 	} else if typeStr == "response.content_part.added" {
 		template = `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
 		template, _ = sjson.Set(template, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
-		(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
+		if !(*param).(*ConvertCodexResponseToClaudeParams).HasContent {
+			(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
+		}
 
 		output = "event: content_block_start\n"
 		output += fmt.Sprintf("data: %s\n\n", template)
+		prependMessageStartIfNeeded()
 	} else if typeStr == "response.output_text.delta" {
 		template = `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
 		template, _ = sjson.Set(template, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
@@ -113,11 +139,58 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 		output = "event: content_block_stop\n"
 		output += fmt.Sprintf("data: %s\n\n", template)
+	} else if typeStr == "response.failed" || typeStr == "response.cancelled" || typeStr == "response.incomplete" {
+		// Handle error responses from Codex API
+		// Generate an error message to prevent "No assistant messages found" error
+		errorMsg := "Error: "
+		status := rootResult.Get("response.status").String()
+		if status != "" {
+			errorMsg += status
+		} else {
+			errorMsg += typeStr
+		}
+
+		// Try to get more details from error or incomplete_details
+		if errObj := rootResult.Get("response.error"); errObj.Exists() {
+			if errMsg := errObj.Get("message").String(); errMsg != "" {
+				errorMsg = fmt.Sprintf("Error: %s", errMsg)
+			}
+		}
+		if incompleteDetails := rootResult.Get("response.incomplete_details"); incompleteDetails.Exists() {
+			if reason := incompleteDetails.Get("reason").String(); reason != "" {
+				errorMsg = fmt.Sprintf("Error: Request incomplete - %s", reason)
+			}
+		}
+
+		log.Warnf("codex->claude translator: received %s, generating error message", typeStr)
+
+		// Generate error response
+		(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
+		prependMessageStartIfNeeded()
+
+		output = "event: content_block_start\n"
+		output += fmt.Sprintf("data: {\"type\":\"content_block_start\",\"index\":%d,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
+		output += "event: content_block_delta\n"
+		data, _ := sjson.Set(`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
+		data, _ = sjson.Set(data, "delta.text", errorMsg)
+		output += fmt.Sprintf("data: %s\n\n", data)
+		output += "event: content_block_stop\n"
+		output += fmt.Sprintf("data: {\"type\":\"content_block_stop\",\"index\":%d}\n\n", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
+		(*param).(*ConvertCodexResponseToClaudeParams).BlockIndex++
+
+		// Send message_delta and message_stop
+		output += "event: message_delta\n"
+		output += `data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`
+		output += "\n\n"
+		output += "event: message_stop\n"
+		output += `data: {"type":"message_stop"}`
+		output += "\n\n"
 	} else if typeStr == "response.completed" {
 		// Only send message_delta and message_stop if we have actually output content
 		// This prevents "No assistant messages found" error in Claude Code when the model
 		// returns an empty response (only response.created + response.completed without content)
 		if !(*param).(*ConvertCodexResponseToClaudeParams).HasContent {
+			log.Warnf("codex->claude translator: received response.completed but HasContent=false, originalRequest=%s", string(originalRequestRawJSON))
 			return []string{}
 		}
 
@@ -155,8 +228,11 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		itemResult := rootResult.Get("item")
 		itemType := itemResult.Get("type").String()
 		if itemType == "function_call" {
+			log.Debugf("codex->claude translator: processing function_call, name=%s, call_id=%s", itemResult.Get("name").String(), itemResult.Get("call_id").String())
 			(*param).(*ConvertCodexResponseToClaudeParams).HasToolCall = true
-			(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
+			if !(*param).(*ConvertCodexResponseToClaudeParams).HasContent {
+				(*param).(*ConvertCodexResponseToClaudeParams).HasContent = true
+			}
 			template = `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"","name":"","input":{}}}`
 			template, _ = sjson.Set(template, "index", (*param).(*ConvertCodexResponseToClaudeParams).BlockIndex)
 			template, _ = sjson.Set(template, "content_block.id", itemResult.Get("call_id").String())
@@ -178,6 +254,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 
 			output += "event: content_block_delta\n"
 			output += fmt.Sprintf("data: %s\n\n", template)
+			prependMessageStartIfNeeded()
 		}
 	} else if typeStr == "response.output_item.done" {
 		itemResult := rootResult.Get("item")
@@ -199,7 +276,12 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
 		output += fmt.Sprintf("data: %s\n\n", template)
 	}
 
-	return []string{output}
+	results := []string{output}
+	// Only log output if there's actual content
+	if output != "" {
+		logging.LogTranslatorOutput("codex->claude", "", results)
+	}
+	return results
 }
 
 // ConvertCodexResponseToClaudeNonStream converts a non-streaming Codex response to a non-streaming Claude Code response.

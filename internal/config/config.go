@@ -51,6 +51,10 @@ type Config struct {
 	// When exceeded, the oldest log files are deleted until within the limit. Set to 0 to disable.
 	LogsMaxTotalSizeMB int `yaml:"logs-max-total-size-mb" json:"logs-max-total-size-mb"`
 
+	// TranslatorDebugLog enables detailed debug logging for translators to a separate file.
+	// This is useful for debugging translator input/output issues without cluttering the main log.
+	TranslatorDebugLog bool `yaml:"translator-debug-log" json:"translator-debug-log"`
+
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
 

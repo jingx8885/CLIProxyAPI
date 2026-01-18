@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"strings"
 
+	log "github.com/sirupsen/logrus"
+
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -51,6 +54,10 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	ThinkingContentBlockIndex int
 	// Next available content block index
 	NextContentBlockIndex int
+	// Stores the message_start event to be sent when content is detected
+	PendingMessageStart string
+	// Tracks whether any content (text, thinking, or tool use) has been output
+	HasContent bool
 }
 
 // ToolCallAccumulator holds the state for accumulating tool call data
@@ -97,17 +104,32 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 	}
 	rawJSON = bytes.TrimSpace(rawJSON[5:])
 
+	// Log input for debugging (only after confirming it has data: prefix)
+	logging.LogTranslatorInput("openai->claude", "", rawJSON)
+
 	// Check if this is the [DONE] marker
 	rawStr := strings.TrimSpace(string(rawJSON))
 	if rawStr == "[DONE]" {
-		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
+		results := convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
+		if len(results) > 0 {
+			logging.LogTranslatorOutput("openai->claude", "", results)
+		}
+		return results
 	}
 
 	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
 	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
+		results := convertOpenAINonStreamingToAnthropic(rawJSON)
+		if len(results) > 0 {
+			logging.LogTranslatorOutput("openai->claude", "", results)
+		}
+		return results
 	} else {
-		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+		results := convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+		if len(results) > 0 {
+			logging.LogTranslatorOutput("openai->claude", "", results)
+		}
+		return results
 	}
 }
 
@@ -127,15 +149,23 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		param.CreatedAt = root.Get("created").Int()
 	}
 
+	// Helper function to prepend message_start if this is the first content
+	prependMessageStartIfNeeded := func() {
+		if param.PendingMessageStart != "" {
+			results = append([]string{param.PendingMessageStart}, results...)
+			param.PendingMessageStart = ""
+		}
+	}
+
 	// Emit message_start on the very first chunk, regardless of whether it has a role field.
 	// Some providers (like Copilot) may send tool_calls in the first chunk without a role field.
 	if delta := root.Get("choices.0.delta"); delta.Exists() {
 		if !param.MessageStarted {
-			// Send message_start event
+			// Prepare message_start event but don't send it yet - wait for actual content
 			messageStartJSON := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`
 			messageStartJSON, _ = sjson.Set(messageStartJSON, "message.id", param.MessageID)
 			messageStartJSON, _ = sjson.Set(messageStartJSON, "message.model", param.Model)
-			results = append(results, "event: message_start\ndata: "+messageStartJSON+"\n\n")
+			param.PendingMessageStart = "event: message_start\ndata: " + messageStartJSON + "\n\n"
 			param.MessageStarted = true
 
 			// Don't send content_block_start for text here - wait for actual content
@@ -146,6 +176,11 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
 				if reasoningText == "" {
 					continue
+				}
+				// Mark that we have content and prepend message_start if needed
+				if !param.HasContent {
+					param.HasContent = true
+					prependMessageStartIfNeeded()
 				}
 				stopTextContentBlock(param, &results)
 				if !param.ThinkingContentBlockStarted {
@@ -168,6 +203,11 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 		// Handle content delta
 		if content := delta.Get("content"); content.Exists() && content.String() != "" {
+			// Mark that we have content and prepend message_start if needed
+			if !param.HasContent {
+				param.HasContent = true
+				prependMessageStartIfNeeded()
+			}
 			// Send content_block_start for text if not already sent
 			if !param.TextContentBlockStarted {
 				stopThinkingContentBlock(param, &results)
@@ -217,6 +257,12 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 					if name := function.Get("name"); name.Exists() {
 						accumulator.Name = name.String()
 
+						// Mark that we have content and prepend message_start if needed
+						if !param.HasContent {
+							param.HasContent = true
+							prependMessageStartIfNeeded()
+						}
+
 						stopThinkingContentBlock(param, &results)
 
 						stopTextContentBlock(param, &results)
@@ -234,6 +280,11 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 						argsText := args.String()
 						if argsText != "" {
 							accumulator.Arguments.WriteString(argsText)
+							// Mark that we have content for argument deltas too
+							if !param.HasContent {
+								param.HasContent = true
+								prependMessageStartIfNeeded()
+							}
 						}
 					}
 				}
@@ -317,6 +368,12 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 // convertOpenAIDoneToAnthropic handles the [DONE] marker and sends final events
 func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams) []string {
 	var results []string
+
+	// If no content was ever output, log a warning and return empty
+	if !param.HasContent {
+		log.Warnf("openai->claude translator: [DONE] received but no content was output, skipping message_stop")
+		return results
+	}
 
 	// Ensure all content blocks are stopped before final events
 	if param.ThinkingContentBlockStarted {
