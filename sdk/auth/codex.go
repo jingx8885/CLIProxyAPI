@@ -193,6 +193,12 @@ waitForCallback:
 		return nil, fmt.Errorf("codex token storage missing account information")
 	}
 
+	// Set proxy URL if provided
+	if opts.ProxyURL != "" {
+		tokenStorage.ProxyURL = opts.ProxyURL
+	}
+
+
 	planType := ""
 	hashAccountID := ""
 	if tokenStorage.IDToken != "" {
@@ -206,6 +212,7 @@ waitForCallback:
 		}
 	}
 	fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
+
 	metadata := map[string]any{
 		"email": tokenStorage.Email,
 	}
